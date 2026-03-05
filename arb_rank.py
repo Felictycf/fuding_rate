@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""
+Rank funding-rate (and indicative basis) arbitrage between:
+  - Variational (omni-client-api ... /metadata/stats)
+  - Lighter (elliot.ai ... /api/v1/*)
+
+This script is intentionally dependency-free (stdlib only).
+
+Important limitations / assumptions (configurable via CLI flags):
+  - Variational funding_rate values appear to be in "percent" units (e.g. 0.1095 == 0.1095%).
+  - Lighter funding `rate` values appear to be fractional units (e.g. 0.0001 == 0.01%).
+  - Lighter public REST endpoints shown here do not provide executable best-bid/ask depth,
+    so Lighter spread/slippage must be approximated with a user-configured bps value.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass
+from dataclasses import replace
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+VARIATIONAL_STATS_URL = (
+    "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
+)
+LIGHTER_FUNDING_URL = "https://mainnet.zklighter.elliot.ai/api/v1/funding-rates"
+LIGHTER_ORDERBOOKS_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
+LIGHTER_ORDERBOOK_DETAILS_URL = (
+    "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id={market_id}"
+)
+
+
+def http_get_json(url: str, timeout_s: float = 20.0) -> Any:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "arb-ranker/1.0 (+https://local)",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8"))
+
+
+def to_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        try:
+            return float(x)
+        except ValueError:
+            return None
+    return None
+
+
+def bps_from_bid_ask(bid: float, ask: float) -> Optional[float]:
+    if bid is None or ask is None:
+        return None
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    mid = 0.5 * (bid + ask)
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid * 1e4
+
+
+def norm_symbol(sym: str) -> str:
+    # Variational uses tickers like "1000FLOKI", Lighter perp uses "1000FLOKI".
+    # Lighter spot symbols look like "LIT/USDC" which we ignore for funding arbs.
+    return (sym or "").strip().upper()
+
+
+def fmt(x: Optional[float], nd: int = 6) -> str:
+    if x is None:
+        return "-"
+    if math.isfinite(x):
+        # Compact small values
+        if abs(x) >= 1000:
+            return f"{x:,.0f}"
+        if abs(x) >= 10:
+            return f"{x:.2f}"
+        if abs(x) >= 1:
+            return f"{x:.4f}"
+        return f"{x:.{nd}g}"
+    return "-"
+
+
+@dataclass(frozen=True)
+class VenueRate:
+    rate_frac_per_interval: float  # funding rate as fraction (e.g. 0.0001 == 0.01%) per interval
+    interval_s: int
+    pos_means_longs_pay: bool
+
+    def pnl_for_side(self, notional_usd: float, side: str) -> float:
+        """
+        Funding PnL for a position over one funding interval.
+        side: "long" or "short"
+        Convention used here:
+          - If pos_means_longs_pay: long pays rate, short receives rate.
+          - Otherwise: long receives rate, short pays rate.
+        """
+        r = self.rate_frac_per_interval
+        if side == "long":
+            return (-r if self.pos_means_longs_pay else +r) * notional_usd
+        if side == "short":
+            return (+r if self.pos_means_longs_pay else -r) * notional_usd
+        raise ValueError(f"unknown side: {side}")
+
+
+@dataclass(frozen=True)
+class MarketRow:
+    symbol: str
+    var_rate: VenueRate
+    lighter_rate: VenueRate
+    lighter_market_id: int
+    # Execution-cost model (bps) for a round-trip on each venue.
+    var_round_trip_bps: float
+    lighter_round_trip_bps: float
+    # Optional pricing signals (indicative only)
+    var_mid: Optional[float]
+    lighter_last: Optional[float]
+
+    def best_funding_trade(self, notional_usd: float) -> Tuple[str, float, float]:
+        """
+        Returns: (strategy_label, pnl_per_day_usd, pnl_per_interval_usd)
+        strategy_label describes which venue is long/short.
+        """
+        # Strategy A: long Variational, short Lighter
+        pnl_a = self.var_rate.pnl_for_side(notional_usd, "long") + self.lighter_rate.pnl_for_side(
+            notional_usd, "short"
+        )
+        # Strategy B: short Variational, long Lighter
+        pnl_b = self.var_rate.pnl_for_side(notional_usd, "short") + self.lighter_rate.pnl_for_side(
+            notional_usd, "long"
+        )
+        # Normalize to per-day using each leg interval; approximate by converting to per-second.
+        # This matters if venues have different funding intervals.
+        pnl_a_per_s = (
+            self.var_rate.pnl_for_side(notional_usd, "long") / self.var_rate.interval_s
+            + self.lighter_rate.pnl_for_side(notional_usd, "short") / self.lighter_rate.interval_s
+        )
+        pnl_b_per_s = (
+            self.var_rate.pnl_for_side(notional_usd, "short") / self.var_rate.interval_s
+            + self.lighter_rate.pnl_for_side(notional_usd, "long") / self.lighter_rate.interval_s
+        )
+        day = 86400.0
+        pnl_a_day = pnl_a_per_s * day
+        pnl_b_day = pnl_b_per_s * day
+
+        if pnl_b_day > pnl_a_day:
+            return ("Short VAR / Long Lighter", pnl_b_day, pnl_b)
+        return ("Long VAR / Short Lighter", pnl_a_day, pnl_a)
+
+    def round_trip_cost_usd(self, notional_usd: float) -> float:
+        total_bps = self.var_round_trip_bps + self.lighter_round_trip_bps
+        return notional_usd * total_bps / 1e4
+
+    def indicative_basis_bps(self) -> Optional[float]:
+        if self.var_mid is None or self.lighter_last is None:
+            return None
+        if self.var_mid <= 0 or self.lighter_last <= 0:
+            return None
+        mid = 0.5 * (self.var_mid + self.lighter_last)
+        return (self.var_mid - self.lighter_last) / mid * 1e4
+
+
+def parse_variational_markets(
+    j: Dict[str, Any],
+    notional_bucket: str,
+    rate_is_percent: bool,
+    pos_means_longs_pay: bool,
+    default_fee_bps: float,
+) -> Dict[str, Tuple[VenueRate, float, Optional[float]]]:
+    """
+    Returns map: symbol -> (VenueRate, round_trip_bps, mid_price)
+    round_trip_bps includes estimated spread + fees for a full open+close.
+    """
+    out: Dict[str, Tuple[VenueRate, float, Optional[float]]] = {}
+    listings = j.get("listings") or []
+    for it in listings:
+        sym = norm_symbol(it.get("ticker"))
+        if not sym:
+            continue
+        fr_raw = to_float(it.get("funding_rate"))
+        interval_s = int(it.get("funding_interval_s") or 28800)
+        if fr_raw is None or interval_s <= 0:
+            continue
+        # Convert to fraction per interval.
+        rate_frac = fr_raw / 100.0 if rate_is_percent else fr_raw
+
+        quotes = it.get("quotes") or {}
+        q = quotes.get(notional_bucket) or quotes.get("base") or {}
+        bid = to_float((q.get("bid") if isinstance(q, dict) else None))
+        ask = to_float((q.get("ask") if isinstance(q, dict) else None))
+        spread_bps = bps_from_bid_ask(bid, ask) if bid and ask else None
+        mid = None
+        if bid and ask and ask >= bid:
+            mid = 0.5 * (bid + ask)
+        elif to_float(it.get("mark_price")):
+            mid = float(it["mark_price"])
+
+        # Round-trip cost bps = spread + 2*fee (fee is per trade, two trades for open+close)
+        rt_bps = (spread_bps if spread_bps is not None else 0.0) + 2.0 * default_fee_bps
+
+        out[sym] = (VenueRate(rate_frac, interval_s, pos_means_longs_pay), rt_bps, mid)
+    return out
+
+
+def parse_lighter_funding(
+    j: Dict[str, Any],
+    rate_is_percent: bool,
+    interval_s: int,
+    pos_means_longs_pay: bool,
+) -> Dict[str, VenueRate]:
+    out: Dict[str, VenueRate] = {}
+    if int(j.get("code") or 0) != 200:
+        raise RuntimeError(f"lighter funding-rates returned code={j.get('code')}")
+    items = j.get("funding_rates") or []
+    for it in items:
+        sym = norm_symbol(it.get("symbol"))
+        r_raw = to_float(it.get("rate"))
+        if not sym or r_raw is None:
+            continue
+        rate_frac = r_raw / 100.0 if rate_is_percent else r_raw
+        out[sym] = VenueRate(rate_frac, interval_s, pos_means_longs_pay)
+    return out
+
+
+def parse_lighter_orderbooks_meta(j: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if int(j.get("code") or 0) != 200:
+        raise RuntimeError(f"lighter orderBooks returned code={j.get('code')}")
+    out: Dict[str, Dict[str, Any]] = {}
+    items = j.get("order_books") or []
+    for it in items:
+        sym = norm_symbol(it.get("symbol"))
+        if not sym:
+            continue
+        out[sym] = it
+    return out
+
+
+def parse_lighter_last_trade_price(details_j: Dict[str, Any]) -> Optional[float]:
+    """
+    Extract a best-effort "last_trade_price" from orderBookDetails.
+
+    Note: this is NOT an executable price (no bid/ask), but can be used as an
+    indicative basis signal vs Variational mid/mark.
+    """
+    if int(details_j.get("code") or 0) != 200:
+        return None
+    for k in ("order_book_details", "spot_order_book_details"):
+        items = details_j.get(k)
+        if isinstance(items, list) and items:
+            p = to_float(items[0].get("last_trade_price"))
+            if p is not None and p > 0:
+                return p
+    return None
+
+
+def build_rows(
+    var: Dict[str, Tuple[VenueRate, float, Optional[float]]],
+    lighter_rates: Dict[str, VenueRate],
+    lighter_meta: Dict[str, Dict[str, Any]],
+    lighter_spread_bps_assumed: float,
+) -> List[MarketRow]:
+    rows: List[MarketRow] = []
+    for sym, (vr, var_rt_bps, var_mid) in var.items():
+        lr = lighter_rates.get(sym)
+        meta = lighter_meta.get(sym)
+        if lr is None or meta is None:
+            continue
+        if (meta.get("market_type") or "").lower() != "perp":
+            continue
+        mid = int(meta.get("market_id") or 0)
+        if mid <= 0:
+            continue
+        # Lighter fees are returned as strings like "0.0000" (fractional). Convert to bps.
+        taker_fee_frac = to_float(meta.get("taker_fee")) or 0.0
+        taker_fee_bps = taker_fee_frac * 1e4
+        # Round-trip = assumed spread + 2*taker_fee
+        lighter_rt_bps = float(lighter_spread_bps_assumed) + 2.0 * float(taker_fee_bps)
+
+        rows.append(
+            MarketRow(
+                symbol=sym,
+                var_rate=vr,
+                lighter_rate=lr,
+                lighter_market_id=mid,
+                var_round_trip_bps=float(var_rt_bps),
+                lighter_round_trip_bps=float(lighter_rt_bps),
+                var_mid=var_mid,
+                lighter_last=None,  # Lighter public endpoints here don't expose executable prices.
+            )
+        )
+    return rows
+
+
+def main(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(
+        description="Rank Variational vs Lighter funding-rate arbitrage opportunities."
+    )
+    ap.add_argument("--notional", type=float, default=1000.0, help="USD notional per leg (default: 1000).")
+    ap.add_argument("--top", type=int, default=30, help="Show top N rows (default: 30).")
+    ap.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout seconds.")
+
+    ap.add_argument(
+        "--var-quote-bucket",
+        choices=["size_1k", "size_100k", "base"],
+        default="size_1k",
+        help="Which Variational quote bucket to use for spread estimate (default: size_1k).",
+    )
+    ap.add_argument(
+        "--var-rate-units",
+        choices=["percent", "fraction"],
+        default="percent",
+        help=(
+            "How to interpret Variational funding_rate numbers. "
+            "'percent' means 0.1095 == 0.1095%%. 'fraction' means 0.0001 == 0.01%%."
+        ),
+    )
+    ap.add_argument(
+        "--lighter-rate-units",
+        choices=["percent", "fraction"],
+        default="fraction",
+        help=(
+            "How to interpret Lighter funding `rate` numbers. "
+            "'fraction' means 0.0001 == 0.01%% (default)."
+        ),
+    )
+    ap.add_argument(
+        "--lighter-funding-interval-s",
+        type=int,
+        default=28800,
+        help="Assumed Lighter funding interval seconds (default: 28800 / 8h).",
+    )
+    ap.add_argument(
+        "--funding-sign",
+        choices=["longs_pay", "longs_receive"],
+        default="longs_pay",
+        help=(
+            "Funding sign convention. 'longs_pay' means +rate => longs pay shorts (default). "
+            "'longs_receive' means +rate => longs receive from shorts."
+        ),
+    )
+    ap.add_argument(
+        "--var-fee-bps",
+        type=float,
+        default=0.0,
+        help="Assumed taker fee (bps) on Variational per trade (default: 0).",
+    )
+    ap.add_argument(
+        "--lighter-spread-bps",
+        type=float,
+        default=5.0,
+        help="Assumed Lighter spread/slippage (bps) per round-trip excluding fees (default: 5).",
+    )
+    ap.add_argument(
+        "--fetch-lighter-last",
+        action="store_true",
+        help="Fetch Lighter orderBookDetails for some markets to attach last_trade_price (slower; optional).",
+    )
+    ap.add_argument(
+        "--fetch-lighter-last-limit",
+        type=int,
+        default=30,
+        help="How many top-ranked rows to fetch last_trade_price for (default: 30).",
+    )
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="Output full ranking as JSON to stdout (instead of a table).",
+    )
+
+    args = ap.parse_args(argv)
+    pos_means_longs_pay = args.funding_sign == "longs_pay"
+
+    t0 = time.time()
+    var_j = http_get_json(VARIATIONAL_STATS_URL, timeout_s=args.timeout)
+    lighter_funding_j = http_get_json(LIGHTER_FUNDING_URL, timeout_s=args.timeout)
+    lighter_meta_j = http_get_json(LIGHTER_ORDERBOOKS_URL, timeout_s=args.timeout)
+
+    var = parse_variational_markets(
+        var_j,
+        notional_bucket=args.var_quote_bucket,
+        rate_is_percent=(args.var_rate_units == "percent"),
+        pos_means_longs_pay=pos_means_longs_pay,
+        default_fee_bps=args.var_fee_bps,
+    )
+    lighter_rates = parse_lighter_funding(
+        lighter_funding_j,
+        rate_is_percent=(args.lighter_rate_units == "percent"),
+        interval_s=args.lighter_funding_interval_s,
+        pos_means_longs_pay=pos_means_longs_pay,
+    )
+    lighter_meta = parse_lighter_orderbooks_meta(lighter_meta_j)
+
+    rows = build_rows(
+        var=var,
+        lighter_rates=lighter_rates,
+        lighter_meta=lighter_meta,
+        lighter_spread_bps_assumed=args.lighter_spread_bps,
+    )
+
+    ranked: List[Tuple[float, MarketRow, str, float, float, float]] = []
+    # Tuple: (net_1d_usd, row, strategy, funding_1d_usd, cost_usd, breakeven_days)
+    for r in rows:
+        strat, funding_1d, _funding_interval = r.best_funding_trade(args.notional)
+        cost = r.round_trip_cost_usd(args.notional)
+        net_1d = funding_1d - cost  # assume you hold ~1 day then close
+        breakeven_days = (cost / funding_1d) if funding_1d > 0 else math.inf
+        ranked.append((net_1d, r, strat, funding_1d, cost, breakeven_days))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    # Optional: fetch indicative prices only for the top-N ranked items.
+    if args.fetch_lighter_last and args.fetch_lighter_last_limit > 0:
+        need = ranked[: min(args.fetch_lighter_last_limit, len(ranked))]
+        by_mid: Dict[int, Optional[float]] = {}
+        for _net_1d, r, _strat, _funding_1d, _cost, _be in need:
+            if r.lighter_market_id in by_mid:
+                continue
+            url = LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=r.lighter_market_id)
+            dj = http_get_json(url, timeout_s=args.timeout)
+            by_mid[r.lighter_market_id] = parse_lighter_last_trade_price(dj)
+
+        # Update the ranked list rows in-place (via dataclasses.replace).
+        updated_ranked: List[Tuple[float, MarketRow, str, float, float, float]] = []
+        for net_1d, r, strat, funding_1d, cost, be in ranked:
+            last = by_mid.get(r.lighter_market_id)
+            if last is not None:
+                r = replace(r, lighter_last=last)
+            updated_ranked.append((net_1d, r, strat, funding_1d, cost, be))
+        ranked = updated_ranked
+
+    if args.json:
+        payload = {
+            "asof_unix": int(time.time()),
+            "notional_usd": args.notional,
+            "assumptions": {
+                "var_rate_units": args.var_rate_units,
+                "lighter_rate_units": args.lighter_rate_units,
+                "funding_sign": args.funding_sign,
+                "var_quote_bucket": args.var_quote_bucket,
+                "var_fee_bps_per_trade": args.var_fee_bps,
+                "lighter_spread_bps_assumed_round_trip_excl_fees": args.lighter_spread_bps,
+                "lighter_funding_interval_s": args.lighter_funding_interval_s,
+                "net_1d_definition": "funding_pnl_over_1_day - estimated_round_trip_cost(open+close)",
+            },
+            "items": [],
+            "fetch_ms": int((time.time() - t0) * 1000),
+        }
+        ranked_show = ranked[: max(args.top, 0)] if args.top else ranked
+        for net_1d, r, strat, funding_1d, cost, breakeven_days in ranked_show:
+            basis_bps = r.indicative_basis_bps()
+            payload["items"].append(
+                {
+                    "symbol": r.symbol,
+                    "strategy": strat,
+                    "funding_pnl_1d_usd": funding_1d,
+                    "round_trip_cost_usd": cost,
+                    "net_1d_usd": net_1d,
+                    "breakeven_days": None if not math.isfinite(breakeven_days) else breakeven_days,
+                    "basis_bps_indicative": basis_bps,
+                    "prices": {"var_mid": r.var_mid, "lighter_last_trade": r.lighter_last},
+                    "var": {
+                        "rate_frac_per_interval": r.var_rate.rate_frac_per_interval,
+                        "interval_s": r.var_rate.interval_s,
+                        "round_trip_bps": r.var_round_trip_bps,
+                    },
+                    "lighter": {
+                        "rate_frac_per_interval": r.lighter_rate.rate_frac_per_interval,
+                        "interval_s": r.lighter_rate.interval_s,
+                        "round_trip_bps": r.lighter_round_trip_bps,
+                    },
+                }
+            )
+        json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return 0
+
+    # Table output (Chinese column labels as requested).
+    print(f"名义本金: {args.notional:.2f} USD/腿 (两边各开一腿)")
+    print("排名指标: 预计净收益/天 = 资金费率收益/天 - 预估开平成本(两边合计)")
+    print(f"可匹配标的数: {len(ranked)} (VAR 标的 ∩ Lighter 永续标的 ∩ Lighter 资金费率)")
+    print("")
+
+    header = (
+        "排名  标的         策略                    预计净收益/天($)  资金费率收益/天($)  开平成本($)  回本(天)  "
+        "参考基差(bps)  VAR开平(bps)  Lighter开平(bps)  VAR间隔(h)  Lighter间隔(h)  VAR费率/周期    Lighter费率/周期"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for i, (net_1d, r, strat, funding_1d, cost, breakeven_days) in enumerate(
+        ranked[: max(args.top, 0)], start=1
+    ):
+        basis_bps = r.indicative_basis_bps()
+        print(
+            f"{i:>4}  {r.symbol:<12} {strat:<24} {net_1d:>13.2f}  {funding_1d:>16.2f}  {cost:>10.2f}  "
+            f"{(breakeven_days if math.isfinite(breakeven_days) else float('nan')):>7.2f}  "
+            f"{(basis_bps if basis_bps is not None else float('nan')):>12.2f}  "
+            f"{r.var_round_trip_bps:>11.2f}  {r.lighter_round_trip_bps:>14.2f}  "
+            f"{(r.var_rate.interval_s/3600.0):>10.2f}  {(r.lighter_rate.interval_s/3600.0):>13.2f}  "
+            f"{r.var_rate.rate_frac_per_interval:>12.6g}  {r.lighter_rate.rate_frac_per_interval:>14.6g}"
+        )
+
+    print("")
+    print("说明:")
+    print("- Lighter 的真实点差/滑点无法从这些公开接口直接得到；请用 --lighter-spread-bps 调整假设。")
+    print("- 参考基差(bps) 使用 Lighter 的 orderBookDetails.last_trade_price 计算，仅供参考(不是可成交 bid/ask)。")
+    print("- 如果资金费率符号约定相反，请用 --funding-sign longs_receive。")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

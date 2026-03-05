@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>套利雷达 | Variational × Lighter</title>
+    <meta name="color-scheme" content="light" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..900&family=IBM+Plex+Mono:wght@300;400;600&family=IBM+Plex+Sans+Condensed:wght@300;400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg">
+      <div class="mesh"></div>
+      <div class="grain"></div>
+    </div>
+
+    <header class="top">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <div class="brandText">
+          <div class="title">套利雷达</div>
+          <div class="subtitle">Variational × Lighter</div>
+        </div>
+      </div>
+
+      <div class="controls" role="group" aria-label="筛选条件">
+        <label class="field">
+          <span>名义本金</span>
+          <input id="notional" inputmode="decimal" value="1000" />
+          <em>USD/腿</em>
+        </label>
+        <label class="field">
+          <span>展示</span>
+          <input id="top" inputmode="numeric" value="30" />
+          <em>条</em>
+        </label>
+        <label class="field">
+          <span>Lighter点差</span>
+          <input id="lighterSpread" inputmode="decimal" value="5" />
+          <em>bps/笔(假设)</em>
+        </label>
+        <button id="refresh" class="btn">
+          <span class="btnDot" aria-hidden="true"></span>
+          刷新
+        </button>
+      </div>
+
+      <div class="meta">
+        <div class="pill">
+          <span class="k">自动刷新</span>
+          <span class="v">每 5 分钟</span>
+        </div>
+        <div class="pill">
+          <span class="k">上次更新</span>
+          <span class="v" id="updatedAt">-</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <section class="grid">
+        <article class="panel" id="panelFunding">
+          <div class="panelHead">
+            <div>
+              <h2>资金费率套利</h2>
+              <p class="hint">
+                目标：跨平台对冲赚 funding 差。成本含：VAR真实点差，Lighter点差为假设值。
+              </p>
+            </div>
+            <div class="tags">
+              <span class="tag">排名：预计净收益/天</span>
+              <span class="tag mono">API: /api/funding</span>
+            </div>
+          </div>
+          <div class="tableWrap">
+            <table class="tbl" id="tblFunding">
+              <thead>
+                <tr>
+                  <th>排名</th>
+                  <th>标的</th>
+                  <th>策略</th>
+                  <th class="num">预计净收益/天</th>
+                  <th class="num">资金费率收益/天</th>
+                  <th class="num">开平成本</th>
+                  <th class="num">回本(天)</th>
+                  <th class="num">VAR开平(bps)</th>
+                  <th class="num">Lighter开平(bps)</th>
+                  <th class="num">参考基差(bps)</th>
+                </tr>
+              </thead>
+              <tbody id="fundingBody">
+                <tr class="skeleton">
+                  <td colspan="10">加载中...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="footnote" id="fundingNote"></div>
+        </article>
+
+        <article class="panel" id="panelPrice">
+          <div class="panelHead">
+            <div>
+              <h2>差价套利(参考)</h2>
+              <p class="hint">
+                目标：买低卖高等价差收敛。注意：Lighter 侧价格来自 last_trade_price（非可成交bid/ask）。
+              </p>
+            </div>
+            <div class="tags">
+              <span class="tag">排名：参考净利润(往返)</span>
+              <span class="tag mono">API: /api/price</span>
+            </div>
+          </div>
+          <div class="tableWrap">
+            <table class="tbl" id="tblPrice">
+              <thead>
+                <tr>
+                  <th>排名</th>
+                  <th>标的</th>
+                  <th>方向(参考)</th>
+                  <th class="num">参考差价(bps)</th>
+                  <th class="num">理论毛利润</th>
+                  <th class="num">往返成本(bps)</th>
+                  <th class="num">参考净利润</th>
+                  <th class="num">VAR点差(bps)</th>
+                  <th class="num">L_taker(bps)</th>
+                  <th class="num">VAR_mid</th>
+                  <th class="num">L_last</th>
+                </tr>
+              </thead>
+              <tbody id="priceBody">
+                <tr class="skeleton">
+                  <td colspan="11">加载中...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="footnote" id="priceNote"></div>
+        </article>
+      </section>
+
+      <section class="panel history">
+        <div class="panelHead">
+          <div>
+            <h2>历史价差分析</h2>
+            <p class="hint">
+              记录并绘制 VAR vs Lighter 的基差/价差历史。建议对单一标的开启采样（默认 10 秒/次）。
+            </p>
+          </div>
+          <div class="tags">
+            <span class="tag">图表：bps</span>
+            <span class="tag mono">API: /api/basis_history</span>
+          </div>
+        </div>
+
+        <div class="historyControls">
+          <label class="field">
+            <span>交易对</span>
+            <select id="histSymbol"></select>
+            <em>perp</em>
+          </label>
+
+          <div class="range">
+            <button class="chip" data-range="1800">30m</button>
+            <button class="chip" data-range="3600">1h</button>
+            <button class="chip" data-range="14400">4h</button>
+            <button class="chip" data-range="43200">12h</button>
+            <button class="chip active" data-range="86400">1d</button>
+            <button class="chip" data-range="259200">3d</button>
+          </div>
+
+          <label class="field">
+            <span>相对基准</span>
+            <input id="histBaseline" inputmode="decimal" value="0" />
+            <em>bp</em>
+          </label>
+
+          <label class="toggle">
+            <input id="histWatch" type="checkbox" checked />
+            <span>开启采样</span>
+            <em>10秒</em>
+          </label>
+
+          <div class="src">
+            <label class="radio">
+              <input type="radio" name="histSource" value="basis" checked />
+              <span>基差</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="histSource" value="price_diff" />
+              <span>差价</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="histSource" value="funding_basis" />
+              <span>资金页基差</span>
+            </label>
+          </div>
+
+          <button id="histRefresh" class="btn">
+            <span class="btnDot" aria-hidden="true"></span>
+            更新图表
+          </button>
+        </div>
+
+        <div class="chartCard">
+          <canvas id="histCanvas" width="1600" height="520"></canvas>
+          <div class="chartOverlay">
+            <div class="chartStat" id="histStat">-</div>
+            <div class="chartStat mono" id="histTip">拖动鼠标查看点位</div>
+          </div>
+        </div>
+        <div class="footnote" id="histNote"></div>
+      </section>
+
+      <section class="bottombar">
+        <div class="legend">
+          <span class="swatch good" aria-hidden="true"></span>
+          <span>正收益</span>
+          <span class="swatch bad" aria-hidden="true"></span>
+          <span>负收益</span>
+          <span class="swatch warn" aria-hidden="true"></span>
+          <span>薄利/不确定</span>
+        </div>
+        <div class="small">
+          提醒：这是“数据看板”，不是交易建议。差价套利部分需要可成交盘口才能严格评估。
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
