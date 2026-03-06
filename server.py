@@ -19,6 +19,7 @@ import os
 import time
 import threading
 import sqlite3
+import statistics
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from http import HTTPStatus
@@ -281,6 +282,62 @@ def _bps(var_mid: float | None, lighter_last: float | None) -> float | None:
     return (var_mid - lighter_last) / mid * 1e4
 
 
+def _spread_bps(bid: float | None, ask: float | None) -> float | None:
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    m = 0.5 * (bid + ask)
+    if m <= 0:
+        return None
+    return (ask - bid) / m * 1e4
+
+
+def _quote_from_mid(mid: float | None, spread_bps: float | None) -> tuple[float | None, float | None]:
+    if mid is None or mid <= 0:
+        return (None, None)
+    s = float(spread_bps or 0.0)
+    if s < 0:
+        s = 0.0
+    half = s / 20000.0
+    return (mid * (1.0 - half), mid * (1.0 + half))
+
+
+def _infer_symbol_spreads(
+    symbol: str, source: str, since_ts: int | None = None
+) -> tuple[float | None, float | None]:
+    params: list[object] = [symbol, source]
+    since_sql = ""
+    if since_ts is not None and since_ts > 0:
+        since_sql = " AND ts>=? "
+        params.append(int(since_ts))
+    with DB_LOCK:
+        cur = DB.execute(
+            f"""
+            SELECT var_bid, var_ask, lighter_bid, lighter_ask
+            FROM basis_samples
+            WHERE symbol=? AND source=? {since_sql}
+              AND var_bid IS NOT NULL AND var_ask IS NOT NULL
+              AND lighter_bid IS NOT NULL AND lighter_ask IS NOT NULL
+            ORDER BY ts DESC
+            LIMIT 500
+            """,
+            tuple(params),
+        )
+        rows = cur.fetchall()
+
+    v_spreads: list[float] = []
+    l_spreads: list[float] = []
+    for vb, va, lb, la in rows:
+        vs = _spread_bps(vb, va)
+        ls = _spread_bps(lb, la)
+        if vs is not None and vs >= 0:
+            v_spreads.append(vs)
+        if ls is not None and ls >= 0:
+            l_spreads.append(ls)
+    var_s = statistics.median(v_spreads) if v_spreads else None
+    lighter_s = statistics.median(l_spreads) if l_spreads else None
+    return (var_s, lighter_s)
+
+
 _VAR_CACHE: tuple[float, dict] | None = None
 _LIGHTER_MAP_CACHE: tuple[float, dict] | None = None
 
@@ -474,6 +531,54 @@ class Handler(BaseHTTPRequestHandler):
         # Keep server logs quiet; frontend shows errors directly.
         return
 
+    def _history_row_to_point(
+        self,
+        r: tuple,
+        fill_quotes: bool,
+        est_var_spread_bps: float | None,
+        est_lighter_spread_bps: float | None,
+    ) -> dict:
+        ts = int(r[0])
+        bps = r[1]
+        var_mid = r[2]
+        lighter_last = r[3]
+        var_bid = r[4]
+        var_ask = r[5]
+        lighter_bid = r[6]
+        lighter_ask = r[7]
+        has_raw = all(x is not None for x in (var_bid, var_ask, lighter_bid, lighter_ask))
+
+        quote_mode = "raw" if has_raw else "none"
+        if fill_quotes and not has_raw:
+            if var_bid is None or var_ask is None:
+                vb, va = _quote_from_mid(var_mid, est_var_spread_bps)
+                if var_bid is None:
+                    var_bid = vb
+                if var_ask is None:
+                    var_ask = va
+            if lighter_bid is None or lighter_ask is None:
+                lb, la = _quote_from_mid(lighter_last, est_lighter_spread_bps)
+                if lighter_bid is None:
+                    lighter_bid = lb
+                if lighter_ask is None:
+                    lighter_ask = la
+            if all(x is not None for x in (var_bid, var_ask, lighter_bid, lighter_ask)):
+                quote_mode = "estimated"
+
+        has_dual = all(x is not None for x in (var_bid, var_ask, lighter_bid, lighter_ask))
+        return {
+            "ts": ts,
+            "bps": bps,
+            "var_mid": var_mid,
+            "lighter_last": lighter_last,
+            "var_bid": var_bid,
+            "var_ask": var_ask,
+            "lighter_bid": lighter_bid,
+            "lighter_ask": lighter_ask,
+            "has_dual_quotes": has_dual,
+            "quote_mode": quote_mode if has_dual else "none",
+        }
+
     def do_GET(self) -> None:
         u = urlparse(self.path)
         if u.path.startswith("/api/"):
@@ -633,6 +738,7 @@ class Handler(BaseHTTPRequestHandler):
                 source = _qget(q, "source", "basis")
                 range_s_raw = _qget_int(q, "range_s", 3600)
                 limit_raw = _qget_int(q, "limit", 2000)
+                fill_quotes = _qget_bool(q, "fill_quotes", True)
                 range_s, limit = normalize_history_query(range_s_raw, limit_raw)
                 if source not in HISTORY_SOURCES:
                     self._send_json(400, {"error": f"invalid source: {source}"})
@@ -653,19 +759,46 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     rows = cur.fetchall()
                 rows.reverse()
+                # For old rows that only have mid/last, estimate bid/ask using median spreads
+                # from recent quoted history, falling back to current live spread if needed.
+                est_var_spread_bps: float | None = None
+                est_lighter_spread_bps: float | None = None
+                if fill_quotes:
+                    est_var_spread_bps, est_lighter_spread_bps = _infer_symbol_spreads(
+                        symbol=symbol, source=source, since_ts=since - 7 * 24 * 3600
+                    )
+                    if est_var_spread_bps is None or est_lighter_spread_bps is None:
+                        try:
+                            vb, va, _vm = _get_var_quote(symbol, timeout_s=6.0)
+                            lb, la, _lm = _get_lighter_quote(symbol, timeout_s=6.0)
+                            if est_var_spread_bps is None:
+                                est_var_spread_bps = _spread_bps(vb, va)
+                            if est_lighter_spread_bps is None:
+                                est_lighter_spread_bps = _spread_bps(lb, la)
+                        except Exception:
+                            pass
+                    if est_var_spread_bps is None:
+                        est_var_spread_bps = 10.0
+                    if est_lighter_spread_bps is None:
+                        est_lighter_spread_bps = 12.0
+
+                raw_quote_points = 0
+                estimated_quote_points = 0
                 points_raw = [
-                    {
-                        "ts": int(r[0]),
-                        "bps": r[1],
-                        "var_mid": r[2],
-                        "lighter_last": r[3],
-                        "var_bid": r[4],
-                        "var_ask": r[5],
-                        "lighter_bid": r[6],
-                        "lighter_ask": r[7],
-                    }
+                    self._history_row_to_point(
+                        r=r,
+                        fill_quotes=fill_quotes,
+                        est_var_spread_bps=est_var_spread_bps,
+                        est_lighter_spread_bps=est_lighter_spread_bps,
+                    )
                     for r in rows
                 ]
+                for p in points_raw:
+                    if p.get("has_dual_quotes"):
+                        if p.get("quote_mode") == "raw":
+                            raw_quote_points += 1
+                        elif p.get("quote_mode") == "estimated":
+                            estimated_quote_points += 1
                 points = downsample_points(points_raw, limit)
                 self._send_json(
                     200,
@@ -676,6 +809,11 @@ class Handler(BaseHTTPRequestHandler):
                         "raw_points": len(points_raw),
                         "points_returned": len(points),
                         "downsampled": len(points_raw) > len(points),
+                        "fill_quotes": fill_quotes,
+                        "raw_quote_points": raw_quote_points,
+                        "estimated_quote_points": estimated_quote_points,
+                        "est_var_spread_bps": est_var_spread_bps,
+                        "est_lighter_spread_bps": est_lighter_spread_bps,
                         "points": points,
                         "asof_unix": int(time.time()),
                     },

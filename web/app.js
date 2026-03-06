@@ -641,6 +641,7 @@ async function loadHistory({ force = false } = {}) {
     source,
     range_s: String(rangeS),
     limit: String(targetPoints),
+    fill_quotes: "1",
   });
 
   try {
@@ -669,9 +670,12 @@ async function loadHistory({ force = false } = {}) {
     $("histStat").textContent = statParts.length ? `${symbol} 最新 · ${statParts.join(" · ")}` : `${symbol} · 无数据`;
     const sampled = j.downsampled ? "（已下采样）" : "";
     const cov = meta.coverage || { blue: 0, green: 0, total: pts.length };
-    $("histNote").textContent = `点数：${pts.length}${sampled} · 有效报价(蓝/绿)：${cov.blue || 0}/${pts.length} · ${
-      cov.green || 0
-    }/${pts.length} · 数据源：${source} · 时间范围：${Math.round(rangeS / 60)} 分钟`;
+    const rawQ = Number(j.raw_quote_points || 0);
+    const estQ = Number(j.estimated_quote_points || 0);
+    const estTag = estQ > 0 ? ` · 估算报价点：${estQ}` : "";
+    $("histNote").textContent = `点数：${pts.length}${sampled} · 原始双边报价点：${rawQ}${estTag} · 有效报价(蓝/绿)：${
+      cov.blue || 0
+    }/${pts.length} · ${cov.green || 0}/${pts.length} · 数据源：${source} · 时间范围：${Math.round(rangeS / 60)} 分钟`;
 
     // Mouse hover for tip
     if (meta && meta.xScale) {
