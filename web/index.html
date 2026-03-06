@@ -151,11 +151,11 @@
           <div>
             <h2>历史价差分析</h2>
             <p class="hint">
-              记录并绘制 VAR vs Lighter 的基差/价差历史。建议对单一标的开启采样（默认 10 秒/次）。
+              双线展示两种跨交易所方向的实时历史 bps：蓝线=买LG卖OM(OM Bid - LG Ask)，绿线=买OM卖LG(LG Bid - OM Ask)。
             </p>
           </div>
           <div class="tags">
-            <span class="tag">图表：bps</span>
+            <span class="tag">图表：双向 bps</span>
             <span class="tag mono">API: /api/basis_history</span>
           </div>
         </div>
@@ -203,6 +203,17 @@
             </label>
           </div>
 
+          <div class="src">
+            <label class="radio">
+              <input id="histShowVar" type="checkbox" checked />
+              <span>买LG卖OM(蓝)</span>
+            </label>
+            <label class="radio">
+              <input id="histShowLighter" type="checkbox" checked />
+              <span>买OM卖LG(绿)</span>
+            </label>
+          </div>
+
           <button id="histRefresh" class="btn">
             <span class="btnDot" aria-hidden="true"></span>
             更新图表
@@ -213,7 +224,7 @@
           <canvas id="histCanvas" width="1600" height="520"></canvas>
           <div class="chartOverlay">
             <div class="chartStat" id="histStat">-</div>
-            <div class="chartStat mono" id="histTip">拖动鼠标查看点位</div>
+            <div class="chartStat mono" id="histTip">拖动鼠标查看双向 bps</div>
           </div>
         </div>
         <div class="footnote" id="histNote"></div>

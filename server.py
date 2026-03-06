@@ -112,10 +112,24 @@ def _db() -> sqlite3.Connection:
           var_mid REAL,
           lighter_last REAL,
           bps REAL,
+          var_bid REAL,
+          var_ask REAL,
+          lighter_bid REAL,
+          lighter_ask REAL,
           PRIMARY KEY (ts, symbol, source)
         )
         """
     )
+    cur = conn.execute("PRAGMA table_info(basis_samples)")
+    cols = {str(r[1]) for r in cur.fetchall()}
+    for name, decl in (
+        ("var_bid", "REAL"),
+        ("var_ask", "REAL"),
+        ("lighter_bid", "REAL"),
+        ("lighter_ask", "REAL"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE basis_samples ADD COLUMN {name} {decl}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_basis_symbol_source_ts ON basis_samples(symbol, source, ts)"
     )
@@ -126,12 +140,31 @@ DB = _db()
 DB_LOCK = threading.Lock()
 
 
-def _db_insert_many(rows: list[tuple[int, str, str, float | None, float | None, float | None]]) -> None:
+def _db_insert_many(
+    rows: list[
+        tuple[
+            int,
+            str,
+            str,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+        ]
+    ]
+) -> None:
     if not rows:
         return
     with DB_LOCK:
         DB.executemany(
-            "INSERT OR IGNORE INTO basis_samples(ts,symbol,source,var_mid,lighter_last,bps) VALUES (?,?,?,?,?,?)",
+            (
+                "INSERT OR IGNORE INTO basis_samples("
+                "ts,symbol,source,var_mid,lighter_last,bps,var_bid,var_ask,lighter_bid,lighter_ask"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?)"
+            ),
             rows,
         )
         DB.commit()
@@ -230,6 +263,15 @@ def normalize_history_symbols_query(range_s: int, limit: int, min_points: int) -
     return (r, l, m)
 
 
+def normalize_min_quote_points(min_quote_points: int) -> int:
+    m = int(min_quote_points)
+    if m < 0:
+        m = 0
+    if m > HIST_SYMBOLS_MIN_POINTS_MAX:
+        m = HIST_SYMBOLS_MIN_POINTS_MAX
+    return m
+
+
 def _bps(var_mid: float | None, lighter_last: float | None) -> float | None:
     if not var_mid or not lighter_last or var_mid <= 0 or lighter_last <= 0:
         return None
@@ -243,7 +285,7 @@ _VAR_CACHE: tuple[float, dict] | None = None
 _LIGHTER_MAP_CACHE: tuple[float, dict] | None = None
 
 
-def _get_var_mid(symbol: str, timeout_s: float = 10.0) -> float | None:
+def _get_var_quote(symbol: str, timeout_s: float = 10.0) -> tuple[float | None, float | None, float | None]:
     global _VAR_CACHE
     now = time.time()
     if _VAR_CACHE and (now - _VAR_CACHE[0]) < 5.0:
@@ -255,22 +297,34 @@ def _get_var_mid(symbol: str, timeout_s: float = 10.0) -> float | None:
     for it in j.get("listings", []) or []:
         if (it.get("ticker") or "").upper() == sym:
             mp = it.get("mark_price")
+            bid: float | None = None
+            ask: float | None = None
+            quotes = it.get("quotes") or {}
+            q = quotes.get("size_1k") or quotes.get("base") or {}
+            try:
+                bid_v = float((q or {}).get("bid"))
+                ask_v = float((q or {}).get("ask"))
+                if bid_v > 0 and ask_v > 0 and ask_v >= bid_v:
+                    bid = bid_v
+                    ask = ask_v
+            except Exception:
+                bid = None
+                ask = None
+            if bid is not None and ask is not None:
+                return (bid, ask, 0.5 * (bid + ask))
             try:
                 v = float(mp)
             except Exception:
                 v = None
             if v and v > 0:
-                return v
-            # fallback: use quote mid if present
-            q = (it.get("quotes") or {}).get("size_1k") or (it.get("quotes") or {}).get("base") or {}
-            try:
-                bid = float(q.get("bid"))
-                ask = float(q.get("ask"))
-                if bid > 0 and ask > 0 and ask >= bid:
-                    return 0.5 * (bid + ask)
-            except Exception:
-                return None
-    return None
+                return (bid, ask, v)
+            return (bid, ask, None)
+    return (None, None, None)
+
+
+def _get_var_mid(symbol: str, timeout_s: float = 10.0) -> float | None:
+    _bid, _ask, mid = _get_var_quote(symbol, timeout_s=timeout_s)
+    return mid
 
 
 def _get_lighter_market_map(timeout_s: float = 10.0) -> dict:
@@ -319,21 +373,23 @@ def _extract_best_bid_ask(orders_j: dict) -> tuple[float | None, float | None]:
     return (best_bid, best_ask)
 
 
-def _get_lighter_last(symbol: str, timeout_s: float = 10.0) -> float | None:
+def _get_lighter_quote(
+    symbol: str, timeout_s: float = 10.0
+) -> tuple[float | None, float | None, float | None]:
     m = _get_lighter_market_map(timeout_s=timeout_s)
     mid = m.get(symbol.upper())
     if not mid:
-        return None
+        return (None, None, None)
     orders_url = LIGHTER_ORDERBOOK_ORDERS_URL.format(market_id=mid, limit=50)
     oj = _http_get_json(orders_url, timeout_s=timeout_s)
     bid, ask = _extract_best_bid_ask(oj)
     if bid is not None and ask is not None and ask >= bid:
-        return 0.5 * (bid + ask)
+        return (bid, ask, 0.5 * (bid + ask))
 
     url = LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=mid)
     j = _http_get_json(url, timeout_s=timeout_s)
     if int(j.get("code") or 0) != 200:
-        return None
+        return (bid, ask, None)
     for k in ("order_book_details", "spot_order_book_details"):
         arr = j.get(k)
         if isinstance(arr, list) and arr:
@@ -342,8 +398,13 @@ def _get_lighter_last(symbol: str, timeout_s: float = 10.0) -> float | None:
             except Exception:
                 p = None
             if p and p > 0:
-                return p
-    return None
+                return (bid, ask, p)
+    return (bid, ask, None)
+
+
+def _get_lighter_last(symbol: str, timeout_s: float = 10.0) -> float | None:
+    _bid, _ask, last = _get_lighter_quote(symbol, timeout_s=timeout_s)
+    return last
 
 
 def _sampler_loop() -> None:
@@ -355,18 +416,31 @@ def _sampler_loop() -> None:
         if not items:
             continue
         now = time.time()
-        rows: list[tuple[int, str, str, float | None, float | None, float | None]] = []
+        rows: list[
+            tuple[
+                int,
+                str,
+                str,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+            ]
+        ] = []
         for sym, cfg in items:
             interval_s = float(cfg.get("interval_s") or 30.0)
             next_ts = float(cfg.get("next_ts") or 0.0)
             if now < next_ts:
                 continue
             try:
-                var_mid = _get_var_mid(sym, timeout_s=10.0)
-                lighter_last = _get_lighter_last(sym, timeout_s=10.0)
+                var_bid, var_ask, var_mid = _get_var_quote(sym, timeout_s=10.0)
+                lighter_bid, lighter_ask, lighter_last = _get_lighter_quote(sym, timeout_s=10.0)
                 b = _bps(var_mid, lighter_last)
                 ts = int(now)
-                rows.append((ts, sym, "basis", var_mid, lighter_last, b))
+                rows.append((ts, sym, "basis", var_mid, lighter_last, b, var_bid, var_ask, lighter_bid, lighter_ask))
             except Exception:
                 # Ignore and retry next tick
                 pass
@@ -458,8 +532,26 @@ class Handler(BaseHTTPRequestHandler):
                     prices = it.get("prices") or {}
                     var_mid = prices.get("var_mid")
                     ll = prices.get("lighter_last_trade")
+                    var_obj = it.get("var") or {}
+                    var_bid = var_obj.get("bid")
+                    var_ask = var_obj.get("ask")
+                    lighter_bid = prices.get("lighter_best_bid")
+                    lighter_ask = prices.get("lighter_best_ask")
                     if sym:
-                        rows.append((ts, sym, "funding_basis", var_mid, ll, b))
+                        rows.append(
+                            (
+                                ts,
+                                sym,
+                                "funding_basis",
+                                var_mid,
+                                ll,
+                                b,
+                                var_bid,
+                                var_ask,
+                                lighter_bid,
+                                lighter_ask,
+                            )
+                        )
                 _db_insert_many(rows)
                 CACHE.set(key, data)
                 self._send_json(200, data)
@@ -508,10 +600,29 @@ class Handler(BaseHTTPRequestHandler):
                 for it in data.get("items", []) or []:
                     sym = it.get("symbol")
                     b = it.get("diff_bps")
-                    var_mid = (it.get("var") or {}).get("mid")
-                    ll = (it.get("lighter") or {}).get("last_trade")
+                    var_obj = it.get("var") or {}
+                    lighter_obj = it.get("lighter") or {}
+                    var_mid = var_obj.get("mid")
+                    ll = lighter_obj.get("last_trade")
+                    var_bid = var_obj.get("bid")
+                    var_ask = var_obj.get("ask")
+                    lighter_bid = lighter_obj.get("best_bid")
+                    lighter_ask = lighter_obj.get("best_ask")
                     if sym:
-                        rows.append((ts, sym, "price_diff", var_mid, ll, b))
+                        rows.append(
+                            (
+                                ts,
+                                sym,
+                                "price_diff",
+                                var_mid,
+                                ll,
+                                b,
+                                var_bid,
+                                var_ask,
+                                lighter_bid,
+                                lighter_ask,
+                            )
+                        )
                 _db_insert_many(rows)
                 CACHE.set(key, data)
                 self._send_json(200, data)
@@ -532,7 +643,7 @@ class Handler(BaseHTTPRequestHandler):
                 with DB_LOCK:
                     cur = DB.execute(
                         """
-                        SELECT ts, bps, var_mid, lighter_last
+                        SELECT ts, bps, var_mid, lighter_last, var_bid, var_ask, lighter_bid, lighter_ask
                         FROM basis_samples
                         WHERE symbol=? AND source=? AND ts>=?
                         ORDER BY ts DESC
@@ -543,7 +654,16 @@ class Handler(BaseHTTPRequestHandler):
                     rows = cur.fetchall()
                 rows.reverse()
                 points_raw = [
-                    {"ts": int(r[0]), "bps": r[1], "var_mid": r[2], "lighter_last": r[3]}
+                    {
+                        "ts": int(r[0]),
+                        "bps": r[1],
+                        "var_mid": r[2],
+                        "lighter_last": r[3],
+                        "var_bid": r[4],
+                        "var_ask": r[5],
+                        "lighter_bid": r[6],
+                        "lighter_ask": r[7],
+                    }
                     for r in rows
                 ]
                 points = downsample_points(points_raw, limit)
@@ -581,14 +701,68 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "watching": active, "count": len(active)})
                 return
 
+            if u.path == "/api/sample_symbol":
+                symbol = _qget(q, "symbol", "").upper()
+                source = _qget(q, "source", "price_diff")
+                if not symbol:
+                    self._send_json(400, {"error": "symbol required"})
+                    return
+                if source not in HISTORY_SOURCES:
+                    self._send_json(400, {"error": f"invalid source: {source}"})
+                    return
+                var_bid, var_ask, var_mid = _get_var_quote(symbol, timeout_s=max(5.0, min(15.0, timeout_s)))
+                lighter_bid, lighter_ask, lighter_last = _get_lighter_quote(
+                    symbol, timeout_s=max(5.0, min(15.0, timeout_s))
+                )
+                b = _bps(var_mid, lighter_last)
+                ts = int(time.time())
+                _db_insert_many(
+                    [
+                        (
+                            ts,
+                            symbol,
+                            source,
+                            var_mid,
+                            lighter_last,
+                            b,
+                            var_bid,
+                            var_ask,
+                            lighter_bid,
+                            lighter_ask,
+                        )
+                    ]
+                )
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "symbol": symbol,
+                        "source": source,
+                        "ts": ts,
+                        "bps": b,
+                        "var_mid": var_mid,
+                        "lighter_last": lighter_last,
+                        "var_bid": var_bid,
+                        "var_ask": var_ask,
+                        "lighter_bid": lighter_bid,
+                        "lighter_ask": lighter_ask,
+                        "has_dual_quotes": all(
+                            x is not None for x in (var_bid, var_ask, lighter_bid, lighter_ask)
+                        ),
+                    },
+                )
+                return
+
             if u.path == "/api/history_symbols":
                 source = _qget(q, "source", "")
                 range_s_raw = _qget_int(q, "range_s", 30 * 24 * 3600)
                 limit_raw = _qget_int(q, "limit", 300)
                 min_points_raw = _qget_int(q, "min_points", 2)
+                min_quote_points_raw = _qget_int(q, "min_quote_points", 0)
                 range_s, limit, min_points = normalize_history_symbols_query(
                     range_s=range_s_raw, limit=limit_raw, min_points=min_points_raw
                 )
+                min_quote_points = normalize_min_quote_points(min_quote_points_raw)
                 if source and source not in HISTORY_SOURCES:
                     self._send_json(400, {"error": f"invalid source: {source}"})
                     return
@@ -598,23 +772,32 @@ class Handler(BaseHTTPRequestHandler):
                 if source:
                     source_sql = " AND source=? "
                     params.append(source)
-                params.extend([min_points, limit])
+                params.extend([min_points, min_quote_points, limit])
                 with DB_LOCK:
                     cur = DB.execute(
                         f"""
-                        SELECT symbol, COUNT(*) AS c, MAX(ts) AS last_ts
+                        SELECT
+                          symbol,
+                          COUNT(*) AS c,
+                          SUM(
+                            CASE
+                              WHEN var_bid IS NOT NULL AND var_ask IS NOT NULL
+                               AND lighter_bid IS NOT NULL AND lighter_ask IS NOT NULL
+                              THEN 1 ELSE 0 END
+                          ) AS q,
+                          MAX(ts) AS last_ts
                         FROM basis_samples
                         WHERE ts>=? {source_sql}
                         GROUP BY symbol
-                        HAVING COUNT(*)>=?
-                        ORDER BY c DESC, last_ts DESC, symbol ASC
+                        HAVING COUNT(*)>=? AND q>=?
+                        ORDER BY q DESC, c DESC, last_ts DESC, symbol ASC
                         LIMIT ?
                         """,
                         tuple(params),
                     )
                     rows = cur.fetchall()
                 symbols = [
-                    {"symbol": str(r[0]), "points": int(r[1]), "last_ts": int(r[2] or 0)}
+                    {"symbol": str(r[0]), "points": int(r[1]), "quote_points": int(r[2] or 0), "last_ts": int(r[3] or 0)}
                     for r in rows
                 ]
                 self._send_json(
@@ -623,6 +806,7 @@ class Handler(BaseHTTPRequestHandler):
                         "source": source or "all",
                         "range_s": range_s,
                         "min_points": min_points,
+                        "min_quote_points": min_quote_points,
                         "symbols": symbols,
                         "count": len(symbols),
                         "asof_unix": int(time.time()),

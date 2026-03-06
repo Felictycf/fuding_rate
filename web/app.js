@@ -320,19 +320,24 @@ function pickSymbolFromTables() {
 }
 
 async function fetchHistSymbols(source, { force = false } = {}) {
-  const key = "all";
+  const key = `${source || "all"}|q2`;
   const now = Date.now();
   if (!force && histSymbolsCache.key === key && now - histSymbolsCache.ts < 15000) {
     return histSymbolsCache.symbols;
   }
-  const qs = new URLSearchParams({
-    source: "",
-    range_s: String(30 * 24 * 3600),
-    limit: "300",
-    min_points: "1",
-  });
-  const j = await fetchJSON(`/api/history_symbols?${qs.toString()}`);
-  const syms = ((j && j.symbols) || []).map((x) => String(x.symbol || "").trim()).filter(Boolean);
+  const fetchOne = async (minQuotePoints) => {
+    const qs = new URLSearchParams({
+      source: source || "",
+      range_s: String(30 * 24 * 3600),
+      limit: "300",
+      min_points: "2",
+      min_quote_points: String(minQuotePoints),
+    });
+    const j = await fetchJSON(`/api/history_symbols?${qs.toString()}`);
+    return ((j && j.symbols) || []).map((x) => String(x.symbol || "").trim()).filter(Boolean);
+  };
+  let syms = await fetchOne(2);
+  if (!syms.length) syms = await fetchOne(0);
   histSymbolsCache = { key, ts: now, symbols: syms };
   return syms;
 }
@@ -376,7 +381,32 @@ async function syncHistWatch(symbol, on) {
   histWatchSymbol = null;
 }
 
-function drawChart(canvas, points, baselineBp) {
+function toPositive(x) {
+  const n = Number(x);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function crossBps(a, b) {
+  const x = toPositive(a);
+  const y = toPositive(b);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  const mid = 0.5 * (x + y);
+  if (!Number.isFinite(mid) || mid <= 0) return null;
+  return ((x - y) / mid) * 1e4;
+}
+
+function buildDirectionalSeries(points, makerKey, takerKey, baselineBp) {
+  const vals = points.map((p) => {
+    const v = crossBps(p[makerKey], p[takerKey]);
+    return Number.isFinite(v) ? v - baselineBp : null;
+  });
+  const validCount = vals.filter((v) => Number.isFinite(v)).length;
+  return { vals, validCount };
+}
+
+function drawChart(canvas, points, baselineBp, opts = {}) {
+  const showBlue = opts.showBlue !== false;
+  const showGreen = opts.showGreen !== false;
   const ctx = canvas.getContext("2d");
   const w = canvas.width;
   const h = canvas.height;
@@ -397,20 +427,54 @@ function drawChart(canvas, points, baselineBp) {
 
   // Extract series
   const xs = points.map((p) => p.ts);
-  const ys = points.map((p) => (p.bps === null || p.bps === undefined ? null : Number(p.bps) - baselineBp));
-  const valid = ys.filter((v) => Number.isFinite(v));
-  if (valid.length < 2) {
+  if (xs.length < 1) {
     ctx.fillStyle = "rgba(246,240,227,0.8)";
     ctx.font = "14px IBM Plex Mono";
     ctx.fillText("暂无足够历史数据（建议开启采样并等待几分钟）", padL, padT + 30);
-    return { xScale: null, yScale: null, padL, padT, plotW, plotH };
+    return { xScale: null, yScale: null, padL, padT, plotW, plotH, active: [] };
+  }
+
+  // 蓝线: OM Bid - LG Ask（买LG卖OM）
+  const blueSeries = buildDirectionalSeries(points, "var_bid", "lighter_ask", baselineBp);
+  // 绿线: LG Bid - OM Ask（买OM卖LG）
+  const greenSeries = buildDirectionalSeries(points, "lighter_bid", "var_ask", baselineBp);
+
+  const active = [];
+  if (showBlue && blueSeries.validCount >= 1) {
+    active.push({
+      key: "blue",
+      label: "买LG卖OM",
+      formula: "OM Bid - LG Ask",
+      color: "rgba(64,113,255,0.95)",
+      vals: blueSeries.vals,
+      validCount: blueSeries.validCount,
+    });
+  }
+  if (showGreen && greenSeries.validCount >= 1) {
+    active.push({
+      key: "green",
+      label: "买OM卖LG",
+      formula: "LG Bid - OM Ask",
+      color: "rgba(54,209,163,0.95)",
+      vals: greenSeries.vals,
+      validCount: greenSeries.validCount,
+    });
+  }
+  if (!active.length) {
+    ctx.fillStyle = "rgba(246,240,227,0.8)";
+    ctx.font = "14px IBM Plex Mono";
+    ctx.fillText("该区间缺少双边 bid/ask 历史，无法绘制双向bps（可刷新后等待采样）", padL, padT + 30);
+    return { xScale: null, yScale: null, padL, padT, plotW, plotH, active: [] };
   }
 
   const xmin = Math.min(...xs);
   const xmax = Math.max(...xs);
   const spanS = Math.max(1, xmax - xmin);
-  let ymin = Math.min(...valid);
-  let ymax = Math.max(...valid);
+  const allVals = active.flatMap((s) => s.vals).filter((v) => Number.isFinite(v));
+  let ymin = Math.min(...allVals);
+  let ymax = Math.max(...allVals);
+  ymin = Math.min(ymin, 0);
+  ymax = Math.max(ymax, 0);
 
   // Expand range a bit for aesthetics
   const span = Math.max(1e-6, ymax - ymin);
@@ -443,24 +507,42 @@ function drawChart(canvas, points, baselineBp) {
   ctx.lineTo(padL + plotW, y0);
   ctx.stroke();
 
-  // Line
-  ctx.strokeStyle = "rgba(0,209,193,0.95)";
-  ctx.lineWidth = 2.2;
-  ctx.beginPath();
-  let started = false;
-  for (let i = 0; i < xs.length; i++) {
-    const v = ys[i];
-    if (!Number.isFinite(v)) continue;
-    const x = xScale(xs[i]);
-    const y = yScale(v);
-    if (!started) {
-      ctx.moveTo(x, y);
-      started = true;
-    } else {
-      ctx.lineTo(x, y);
+  // Lines
+  const drawSeries = (vals, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    let started = false;
+    let cnt = 0;
+    let lastX = 0;
+    let lastY = 0;
+    for (let i = 0; i < xs.length; i++) {
+      const v = vals[i];
+      if (!Number.isFinite(v)) {
+        started = false;
+        continue;
+      }
+      const x = xScale(xs[i]);
+      const y = yScale(v);
+      lastX = x;
+      lastY = y;
+      cnt += 1;
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
     }
-  }
-  ctx.stroke();
+    ctx.stroke();
+    if (cnt === 1) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  };
+  active.forEach((s) => drawSeries(s.vals, s.color));
 
   // Axes labels
   ctx.fillStyle = "rgba(246,240,227,0.78)";
@@ -496,7 +578,40 @@ function drawChart(canvas, points, baselineBp) {
     ctx.fillText(lab, x, padT + plotH + 14);
   }
 
-  return { xScale, yScale, padL, padT, plotW, plotH, xmin, xmax, ymin, ymax, spanS };
+  // Inline legend for active series
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = "12px IBM Plex Mono";
+  let lx = padL + 10;
+  const ly = padT + 12;
+  active.forEach((s) => {
+    ctx.fillStyle = s.color;
+    ctx.fillRect(lx, ly - 4, 10, 10);
+    lx += 14;
+    ctx.fillStyle = "rgba(246,240,227,0.85)";
+    ctx.fillText(s.label, lx, ly + 1);
+    lx += ctx.measureText(s.label).width + 16;
+  });
+
+  return {
+    xScale,
+    yScale,
+    padL,
+    padT,
+    plotW,
+    plotH,
+    xmin,
+    xmax,
+    ymin,
+    ymax,
+    spanS,
+    active,
+    coverage: {
+      blue: blueSeries.validCount,
+      green: greenSeries.validCount,
+      total: points.length,
+    },
+  };
 }
 
 async function loadHistory({ force = false } = {}) {
@@ -507,10 +622,16 @@ async function loadHistory({ force = false } = {}) {
   const baseline = Number(($("histBaseline").value || "0").trim());
   const baselineBp = Number.isFinite(baseline) ? baseline : 0;
   const targetPoints = Math.min(5000, Math.max(1200, Math.floor(rangeS / 15)));
+  const showBlue = $("histShowVar").checked;
+  const showGreen = $("histShowLighter").checked;
 
   const watchOn = $("histWatch").checked;
   try {
     await syncHistWatch(symbol, watchOn);
+    if (watchOn) {
+      const sqs = new URLSearchParams({ symbol, source });
+      await fetchJSON(`/api/sample_symbol?${sqs.toString()}`);
+    }
   } catch (_) {
     // ignore
   }
@@ -527,23 +648,30 @@ async function loadHistory({ force = false } = {}) {
     if (reqSeq !== historyReqSeq) return;
     const pts = (j && j.points) || [];
     const canvas = $("histCanvas");
-    const meta = drawChart(canvas, pts, baselineBp);
+    const meta = drawChart(canvas, pts, baselineBp, { showBlue, showGreen });
 
-    // Stats
-    const vals = pts
-      .map((p) => (p.bps === null || p.bps === undefined ? null : Number(p.bps) - baselineBp))
-      .filter((v) => Number.isFinite(v));
-    const last = vals.length ? vals[vals.length - 1] : null;
-    const min = vals.length ? Math.min(...vals) : null;
-    const max = vals.length ? Math.max(...vals) : null;
-    $("histStat").textContent =
-      last === null
-        ? `${symbol} · 无数据`
-        : `${symbol} · 最新 ${last.toFixed(2)}bp · 区间[${min.toFixed(2)}, ${max.toFixed(2)}]`;
+    const latestFinite = (vals) => {
+      if (!Array.isArray(vals)) return null;
+      for (let i = vals.length - 1; i >= 0; i--) {
+        if (Number.isFinite(vals[i])) return vals[i];
+      }
+      return null;
+    };
+    const seriesMap = {};
+    (meta.active || []).forEach((s) => {
+      seriesMap[s.key] = s.vals;
+    });
+    const blueLast = latestFinite(seriesMap.blue);
+    const greenLast = latestFinite(seriesMap.green);
+    const statParts = [];
+    if (Number.isFinite(blueLast)) statParts.push(`买LG卖OM ${blueLast.toFixed(2)}bp`);
+    if (Number.isFinite(greenLast)) statParts.push(`买OM卖LG ${greenLast.toFixed(2)}bp`);
+    $("histStat").textContent = statParts.length ? `${symbol} 最新 · ${statParts.join(" · ")}` : `${symbol} · 无数据`;
     const sampled = j.downsampled ? "（已下采样）" : "";
-    $("histNote").textContent = `点数：${pts.length}${sampled} · 数据源：${source} · 时间范围：${Math.round(
-      rangeS / 60
-    )} 分钟`;
+    const cov = meta.coverage || { blue: 0, green: 0, total: pts.length };
+    $("histNote").textContent = `点数：${pts.length}${sampled} · 有效报价(蓝/绿)：${cov.blue || 0}/${pts.length} · ${
+      cov.green || 0
+    }/${pts.length} · 数据源：${source} · 时间范围：${Math.round(rangeS / 60)} 分钟`;
 
     // Mouse hover for tip
     if (meta && meta.xScale) {
@@ -551,18 +679,20 @@ async function loadHistory({ force = false } = {}) {
         const rect = canvas.getBoundingClientRect();
         const x = ((ev.clientX - rect.left) / rect.width) * canvas.width;
         // find nearest point by x
-        let best = null;
+        let bestIdx = -1;
         let bestDx = Infinity;
-        for (const p of pts) {
-          if (p.bps === null || p.bps === undefined) continue;
-          const px = meta.xScale(p.ts);
+        for (let i = 0; i < pts.length; i++) {
+          const hasValue = (meta.active || []).some((s) => Number.isFinite(s.vals[i]));
+          if (!hasValue) continue;
+          const px = meta.xScale(pts[i].ts);
           const dx = Math.abs(px - x);
           if (dx < bestDx) {
             bestDx = dx;
-            best = p;
+            bestIdx = i;
           }
         }
-        if (best) {
+        if (bestIdx >= 0) {
+          const best = pts[bestIdx];
           const d = new Date(best.ts * 1000);
           const ts = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(
             2,
@@ -571,15 +701,24 @@ async function loadHistory({ force = false } = {}) {
             2,
             "0"
           )}:${String(d.getSeconds()).padStart(2, "0")}`;
-          const v = Number(best.bps) - baselineBp;
-          $("histTip").textContent = `${ts} · ${v.toFixed(2)}bp`;
+          const parts = [ts];
+          (meta.active || []).forEach((s) => {
+            const v = s.vals[bestIdx];
+            if (Number.isFinite(v)) {
+              const sign = v > 0 ? "+" : "";
+              parts.push(`${s.label} ${sign}${v.toFixed(2)}bp`);
+            }
+          });
+          $("histTip").textContent = parts.join(" · ");
         }
       };
     } else {
       canvas.onmousemove = null;
+      $("histTip").textContent = "暂无可悬浮查看的数据";
     }
   } catch (e) {
     if (reqSeq !== historyReqSeq) return;
+    $("histStat").textContent = `${symbol} · 加载失败`;
     $("histNote").textContent = `加载失败：${String(e.message || e)}`;
   }
 }
@@ -644,6 +783,8 @@ function initHistory() {
       loadHistory({ force: true });
     });
   });
+  $("histShowVar").addEventListener("change", () => loadHistory({ force: true }));
+  $("histShowLighter").addEventListener("change", () => loadHistory({ force: true }));
   $("histWatch").addEventListener("change", () => loadHistory({ force: true }));
 
   // periodic refresh (chart) every 10s; sampling runs server-side if enabled.
