@@ -110,7 +110,7 @@
             <div>
               <h2>差价套利(参考)</h2>
               <p class="hint">
-                目标：买低卖高等价差收敛。注意：Lighter 侧价格来自 last_trade_price（非可成交bid/ask）。
+                目标：买低卖高等价差收敛。Lighter 侧优先使用 best bid/ask 中间价，缺失时回退到 last_trade_price。
               </p>
             </div>
             <div class="tags">
@@ -132,7 +132,7 @@
                   <th class="num">VAR点差(bps)</th>
                   <th class="num">L_taker(bps)</th>
                   <th class="num">VAR_mid</th>
-                  <th class="num">L_last</th>
+                  <th class="num">L_ref</th>
                 </tr>
               </thead>
               <tbody id="priceBody">

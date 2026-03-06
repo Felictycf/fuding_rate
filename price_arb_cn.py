@@ -4,9 +4,9 @@
 
 重要说明(请务必读)：
 1) Variational 侧我们能拿到 size_1k 的 bid/ask，因此可以计算中间价(mid)、点差(bps)并估算滑点/成本。
-2) Lighter 侧(你提供的公开 REST 接口)没有可成交的 best bid/ask 深度；
-   这里只能用 orderBookDetails 的 last_trade_price 作为“参考价格”，并用参数假设 Lighter 的点差/滑点(bps)。
-3) 因为缺少 Lighter 可成交盘口，本脚本输出的是“参考差价/参考净差价”，不是可保证执行的真实套利利润。
+2) Lighter 侧优先使用 orderBookOrders(best bid/ask) 计算可成交中间价；
+   当盘口缺失时回退到 orderBookDetails.last_trade_price。
+3) 结果仍为估算，不代表可保证执行利润；请结合真实成交滑点与手续费校验。
 
 依赖：仅 Python 标准库
 """
@@ -30,6 +30,9 @@ VARIATIONAL_STATS_URL = (
 LIGHTER_ORDERBOOKS_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
 LIGHTER_ORDERBOOK_DETAILS_URL = (
     "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id={market_id}"
+)
+LIGHTER_ORDERBOOK_ORDERS_URL = (
+    "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders?market_id={market_id}&limit={limit}"
 )
 
 
@@ -159,6 +162,10 @@ def cache_path(cache_dir: str, market_id: int) -> str:
     return os.path.join(cache_dir, f"lighter_orderbookdetails_{market_id}.json")
 
 
+def orders_cache_path(cache_dir: str, market_id: int, limit: int) -> str:
+    return os.path.join(cache_dir, f"lighter_orderbookorders_{market_id}_{limit}.json")
+
+
 def read_cache(path: str, max_age_s: float) -> Optional[Dict[str, Any]]:
     try:
         st = os.stat(path)
@@ -191,6 +198,42 @@ def extract_last_trade_price(details_j: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def extract_best_bid_ask(orders_j: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    if int(orders_j.get("code") or 0) != 200:
+        return (None, None)
+    bids = orders_j.get("bids") or []
+    asks = orders_j.get("asks") or []
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    for it in bids:
+        p = to_float((it or {}).get("price"))
+        if p is None or p <= 0:
+            continue
+        if best_bid is None or p > best_bid:
+            best_bid = p
+    for it in asks:
+        p = to_float((it or {}).get("price"))
+        if p is None or p <= 0:
+            continue
+        if best_ask is None or p < best_ask:
+            best_ask = p
+    if best_bid is not None and best_ask is not None and best_ask < best_bid:
+        return (None, None)
+    return (best_bid, best_ask)
+
+
+def choose_lighter_reference_price(
+    details_j: Dict[str, Any], orders_j: Dict[str, Any]
+) -> Tuple[Optional[float], str, Optional[float], Optional[float]]:
+    bid, ask = extract_best_bid_ask(orders_j)
+    if bid is not None and ask is not None and ask >= bid:
+        return (0.5 * (bid + ask), "orderbook_mid", bid, ask)
+    last = extract_last_trade_price(details_j)
+    if last is not None and last > 0:
+        return (last, "last_trade_fallback", None, None)
+    return (None, "none", None, None)
+
+
 @dataclass(frozen=True)
 class Row:
     标的: str
@@ -199,8 +242,12 @@ class Row:
     VAR_ask: Optional[float]
     VAR_mid: Optional[float]
     Lighter_last: Optional[float]
+    Lighter_bid: Optional[float]
+    Lighter_ask: Optional[float]
+    Lighter_price_source: str
     参考差价_bps: Optional[float]
     VAR点差_bps: Optional[float]
+    Lighter真实点差_bps: Optional[float]
     Lighter假设点差_bps: float
     Lighter_taker_fee_bps: float
     开仓成本_bps: float
@@ -229,9 +276,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="使用 Variational quotes 的哪个档位来估点差，默认 size_1k",
     )
     ap.add_argument("--超时", type=float, default=20.0, help="HTTP 超时秒数，默认 20")
-    ap.add_argument("--并发", type=int, default=16, help="抓取 orderBookDetails 的并发数，默认 16")
+    ap.add_argument("--并发", type=int, default=16, help="抓取 Lighter 盘口接口并发数，默认 16")
     ap.add_argument("--最多市场数", type=int, default=120, help="最多处理多少个 Lighter perp 市场(防止跑太久)，默认 120")
-    ap.add_argument("--缓存秒", type=float, default=30.0, help="orderBookDetails 缓存有效期(秒)，默认 30，0=不缓存")
+    ap.add_argument("--缓存秒", type=float, default=30.0, help="Lighter 盘口缓存有效期(秒)，默认 30，0=不缓存")
+    ap.add_argument("--Lighter盘口limit", type=int, default=50, help="orderBookOrders 拉取深度条数，默认 50，最大 250")
     ap.add_argument(
         "--缓存目录",
         default=os.path.join(os.getcwd(), ".cache_price_arb"),
@@ -308,40 +356,57 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     ensure_dir(args.缓存目录)
 
-    def fetch_one(sym: str, market_id: int) -> Tuple[str, int, Optional[float]]:
-        cp = cache_path(args.缓存目录, market_id)
-        if args.缓存秒 != 0:
-            cached = read_cache(cp, max_age_s=float(args.缓存秒))
-            if isinstance(cached, dict):
-                p = extract_last_trade_price(cached)
-                return (sym, market_id, p)
-        url = LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=market_id)
-        dj = http_get_json(url, timeout_s=args.超时)
-        if args.缓存秒 != 0:
-            try:
-                write_cache(cp, dj)
-            except Exception:
-                pass
-        return (sym, market_id, extract_last_trade_price(dj))
+    limit = max(1, min(250, int(args.Lighter盘口limit)))
 
-    # 3) 并发抓 last_trade_price
-    last_map: Dict[str, Optional[float]] = {}
+    def fetch_one(sym: str, market_id: int) -> Tuple[str, int, Optional[float], Optional[float], Optional[float], str]:
+        cp = cache_path(args.缓存目录, market_id)
+        op = orders_cache_path(args.缓存目录, market_id, limit)
+        details_j: Optional[Dict[str, Any]] = None
+        orders_j: Optional[Dict[str, Any]] = None
+        if args.缓存秒 != 0:
+            cd = read_cache(cp, max_age_s=float(args.缓存秒))
+            co = read_cache(op, max_age_s=float(args.缓存秒))
+            if isinstance(cd, dict):
+                details_j = cd
+            if isinstance(co, dict):
+                orders_j = co
+        if details_j is None:
+            durl = LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=market_id)
+            details_j = http_get_json(durl, timeout_s=args.超时)
+            if args.缓存秒 != 0:
+                try:
+                    write_cache(cp, details_j)
+                except Exception:
+                    pass
+        if orders_j is None:
+            ourl = LIGHTER_ORDERBOOK_ORDERS_URL.format(market_id=market_id, limit=limit)
+            orders_j = http_get_json(ourl, timeout_s=args.超时)
+            if args.缓存秒 != 0:
+                try:
+                    write_cache(op, orders_j)
+                except Exception:
+                    pass
+        px, src, bid, ask = choose_lighter_reference_price(details_j, orders_j)
+        return (sym, market_id, px, bid, ask, src)
+
+    # 3) 并发抓 Lighter 可成交盘口(best bid/ask)，缺失时 fallback last_trade_price
+    ref_map: Dict[str, Tuple[Optional[float], Optional[float], Optional[float], str]] = {}
     with cf.ThreadPoolExecutor(max_workers=max(1, int(args.并发))) as ex:
         futs = [ex.submit(fetch_one, sym, mid) for (sym, mid, _fee) in lighter_markets]
         for fu in cf.as_completed(futs):
-            sym, _mid, last = fu.result()
-            last_map[sym] = last
+            sym, _mid, ref_px, bid, ask, src = fu.result()
+            ref_map[sym] = (ref_px, bid, ask, src)
 
     # 4) 计算差价套利“参考指标”
     rows: List[Row] = []
     for sym, _mid, taker_fee_bps in lighter_markets:
         bid, ask, var_mid, var_spread_bps = var_map.get(sym, (None, None, None, None))
-        lighter_last = last_map.get(sym)
-        if var_mid is None or lighter_last is None:
+        lighter_ref, lighter_bid, lighter_ask, lighter_src = ref_map.get(sym, (None, None, None, "none"))
+        if var_mid is None or lighter_ref is None:
             continue
-        if not is_reasonable_price_ratio(var_mid, lighter_last, args.min_price_ratio, args.max_price_ratio):
+        if not is_reasonable_price_ratio(var_mid, lighter_ref, args.min_price_ratio, args.max_price_ratio):
             continue
-        diff = bps_diff(var_mid, lighter_last)  # VAR - Lighter
+        diff = bps_diff(var_mid, lighter_ref)  # VAR - Lighter
         if diff is None:
             continue
 
@@ -356,7 +421,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 开仓：两边各一次 taker（点差 + fee）
         var_fee_bps = float(args.VAR手续费bps)
         var_open_bps = float(var_spread_bps or 0.0) + var_fee_bps
-        lighter_open_bps = float(args.Lighter点差bps) + float(taker_fee_bps)
+        lighter_real_spread_bps = bps_from_bid_ask(lighter_bid, lighter_ask)
+        lighter_spread_used_bps = (
+            float(lighter_real_spread_bps) if lighter_real_spread_bps is not None else float(args.Lighter点差bps)
+        )
+        lighter_open_bps = lighter_spread_used_bps + float(taker_fee_bps)
         open_cost_bps = var_open_bps + lighter_open_bps
         # 往返：假设平仓成本与开仓对称(再乘 2)
         round_trip_bps = 2.0 * open_cost_bps
@@ -368,9 +437,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 VAR_bid=bid,
                 VAR_ask=ask,
                 VAR_mid=var_mid,
-                Lighter_last=lighter_last,
+                Lighter_last=lighter_ref,
+                Lighter_bid=lighter_bid,
+                Lighter_ask=lighter_ask,
+                Lighter_price_source=lighter_src,
                 参考差价_bps=diff,
                 VAR点差_bps=var_spread_bps,
+                Lighter真实点差_bps=lighter_real_spread_bps,
                 Lighter假设点差_bps=float(args.Lighter点差bps),
                 Lighter_taker_fee_bps=float(taker_fee_bps),
                 开仓成本_bps=open_cost_bps,
@@ -400,12 +473,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "cache_seconds": float(args.缓存秒),
                 "max_markets": int(args.最多市场数),
                 "concurrency": int(args.并发),
+                "lighter_orderbookorders_limit": int(limit),
                 "symbol_aliases": aliases,
                 "symbol_whitelist_size": len(symbol_whitelist),
                 "price_ratio_guardrail": {"min": float(args.min_price_ratio), "max": float(args.max_price_ratio)},
             },
             "notes": [
-                "diff_bps uses VAR_mid vs Lighter last_trade_price (not executable bid/ask).",
+                "diff_bps prefers Lighter orderBookOrders best bid/ask mid; falls back to orderBookDetails.last_trade_price.",
                 "net_u_round_trip assumes symmetric open/close costs.",
             ],
             "items": [],
@@ -429,6 +503,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     },
                     "lighter": {
                         "last_trade": r.Lighter_last,
+                        "best_bid": r.Lighter_bid,
+                        "best_ask": r.Lighter_ask,
+                        "price_source": r.Lighter_price_source,
+                        "spread_bps_used": r.Lighter真实点差_bps,
                         "taker_fee_bps": r.Lighter_taker_fee_bps,
                         "assumed_spread_bps_per_trade": r.Lighter假设点差_bps,
                     },
@@ -440,7 +518,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 5) 输出中文表格
     print(f"名义本金: {args.名义本金:.2f} USD/腿")
-    print("用途: 仅差价套利(参考)。差价使用 VAR_mid vs Lighter last_trade_price(非可成交 bid/ask)。")
+    print("用途: 仅差价套利(参考)。优先使用 Lighter best bid/ask 中间价；缺失时回退到 last_trade_price。")
     print(
         f"成本假设: VAR手续费={args.VAR手续费bps:.2f}bps/笔, Lighter点差(假设)={args.Lighter点差bps:.2f}bps/笔 + Lighter taker_fee"
     )
@@ -475,7 +553,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("说明:")
     print("- 参考净利润(U) = |参考差价(bps)| - 往返成本(bps)，再乘以名义本金。")
     print("- 往返成本(bps) = 2 * (VAR(点差+手续费) + Lighter(点差假设+taker_fee))。")
-    print("- 若你能提供 Lighter 可成交盘口(best bid/ask 或 L2 深度)接口，可将 last_trade 替换为可成交价格并真实计算滑点。")
+    print("- Lighter 成本优先使用 orderBookOrders 实际点差，缺失时才用 --Lighter点差bps 假设。")
     return 0
 
 

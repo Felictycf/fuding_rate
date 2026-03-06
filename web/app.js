@@ -233,6 +233,8 @@ function renderPrice(j) {
 
 async function loadAll({ force = false } = {}) {
   const p = buildParams();
+  const fundingFetchLimit = Math.max(1, Math.min(p.top, 8));
+  const priceMaxMarkets = Math.max(20, Math.min(40, p.top * 2));
   const updatedAt = $("updatedAt");
   updatedAt.textContent = "刷新中…";
 
@@ -242,7 +244,8 @@ async function loadAll({ force = false } = {}) {
     lighter_spread_bps: String(p.lighter_spread_bps),
     var_fee_bps: "0",
     fetch_lighter_last: "1",
-    fetch_lighter_last_limit: String(p.top),
+    fetch_lighter_last_limit: String(fundingFetchLimit),
+    fetch_lighter_last_workers: "8",
     cache_s: "300",
     force: force ? "1" : "0",
   });
@@ -252,18 +255,17 @@ async function loadAll({ force = false } = {}) {
     top: String(p.top),
     lighter_spread_bps: String(p.lighter_spread_bps),
     var_fee_bps: "0",
-    max_markets: "120",
+    max_markets: String(priceMaxMarkets),
     concurrency: "16",
+    timeout_s: "25",
     orderbook_cache_s: "30",
     cache_s: "300",
     force: force ? "1" : "0",
   });
 
   try {
-    const [funding, price] = await Promise.all([
-      fetchJSON(`/api/funding?${qs.toString()}`),
-      fetchJSON(`/api/price?${qs2.toString()}`),
-    ]);
+    const funding = await fetchJSON(`/api/funding?${qs.toString()}`);
+    const price = await fetchJSON(`/api/price?${qs2.toString()}`);
     renderFunding(funding);
     renderPrice(price);
     updatedAt.textContent = nowCN();

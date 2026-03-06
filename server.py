@@ -40,6 +40,9 @@ LIGHTER_ORDERBOOKS_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
 LIGHTER_ORDERBOOK_DETAILS_URL = (
     "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id={market_id}"
 )
+LIGHTER_ORDERBOOK_ORDERS_URL = (
+    "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders?market_id={market_id}&limit={limit}"
+)
 
 
 def _qget(q: dict, name: str, default: str) -> str:
@@ -77,16 +80,18 @@ def _run_module_json(main_fn, argv: list[str], timeout_s: float) -> dict:
     err = io.StringIO()
 
     def _runner() -> int:
-        with redirect_stdout(out), redirect_stderr(err):
-            rc = main_fn(argv)
-            return int(rc or 0)
+        with MODULE_RUN_LOCK:
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = main_fn(argv)
+                return int(rc or 0)
 
     with ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(_runner)
         try:
-            rc = fut.result(timeout=timeout_s)
+            wait_s = max(10.0, float(timeout_s)) + 35.0
+            rc = fut.result(timeout=wait_s)
         except FuturesTimeoutError as e:
-            raise RuntimeError(f"command timeout after {timeout_s}s: {argv}") from e
+            raise RuntimeError(f"command timeout after {wait_s:.1f}s: {argv}") from e
     if rc != 0:
         raise RuntimeError(err.getvalue().strip() or f"command failed: {argv}")
     raw = out.getvalue()
@@ -150,6 +155,7 @@ class _Cache:
 
 
 CACHE = _Cache()
+MODULE_RUN_LOCK = threading.Lock()
 
 WATCH: dict[str, dict] = {}
 WATCH_LOCK = threading.Lock()
@@ -233,11 +239,41 @@ def _get_lighter_market_map(timeout_s: float = 10.0) -> dict:
     return m
 
 
+def _extract_best_bid_ask(orders_j: dict) -> tuple[float | None, float | None]:
+    if int(orders_j.get("code") or 0) != 200:
+        return (None, None)
+    best_bid: float | None = None
+    best_ask: float | None = None
+    for it in (orders_j.get("bids") or []):
+        try:
+            p = float((it or {}).get("price"))
+        except Exception:
+            p = None
+        if p and p > 0:
+            best_bid = p if best_bid is None else max(best_bid, p)
+    for it in (orders_j.get("asks") or []):
+        try:
+            p = float((it or {}).get("price"))
+        except Exception:
+            p = None
+        if p and p > 0:
+            best_ask = p if best_ask is None else min(best_ask, p)
+    if best_bid is not None and best_ask is not None and best_ask < best_bid:
+        return (None, None)
+    return (best_bid, best_ask)
+
+
 def _get_lighter_last(symbol: str, timeout_s: float = 10.0) -> float | None:
     m = _get_lighter_market_map(timeout_s=timeout_s)
     mid = m.get(symbol.upper())
     if not mid:
         return None
+    orders_url = LIGHTER_ORDERBOOK_ORDERS_URL.format(market_id=mid, limit=50)
+    oj = _http_get_json(orders_url, timeout_s=timeout_s)
+    bid, ask = _extract_best_bid_ask(oj)
+    if bid is not None and ask is not None and ask >= bid:
+        return 0.5 * (bid + ask)
+
     url = LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=mid)
     j = _http_get_json(url, timeout_s=timeout_s)
     if int(j.get("code") or 0) != 200:
@@ -319,7 +355,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         ttl_s = _qget_float(q, "cache_s", 300.0)
         force = _qget_bool(q, "force", False)
-        timeout_s = _qget_float(q, "timeout_s", 25.0)
+        timeout_s = _qget_float(q, "timeout_s", 45.0)
 
         try:
             if u.path == "/api/funding":

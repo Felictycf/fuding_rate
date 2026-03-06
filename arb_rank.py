@@ -9,13 +9,15 @@ This script is intentionally dependency-free (stdlib only).
 Important limitations / assumptions (configurable via CLI flags):
   - Variational funding_rate values appear to be in "percent" units (e.g. 0.1095 == 0.1095%).
   - Lighter funding `rate` values appear to be fractional units (e.g. 0.0001 == 0.01%).
-  - Lighter public REST endpoints shown here do not provide executable best-bid/ask depth,
-    so Lighter spread/slippage must be approximated with a user-configured bps value.
+  - For indicative basis, this script now prefers Lighter orderBookOrders best bid/ask mid.
+    If that data is unavailable, it falls back to orderBookDetails.last_trade_price.
+  - Cost model still uses a configurable spread/slippage assumption for ranking.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import json
 import math
 import sys
@@ -33,6 +35,9 @@ LIGHTER_FUNDING_URL = "https://mainnet.zklighter.elliot.ai/api/v1/funding-rates"
 LIGHTER_ORDERBOOKS_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
 LIGHTER_ORDERBOOK_DETAILS_URL = (
     "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails?market_id={market_id}"
+)
+LIGHTER_ORDERBOOK_ORDERS_URL = (
+    "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders?market_id={market_id}&limit={limit}"
 )
 
 
@@ -200,6 +205,9 @@ class MarketRow:
     # Optional pricing signals (indicative only)
     var_mid: Optional[float]
     lighter_last: Optional[float]
+    lighter_bid: Optional[float] = None
+    lighter_ask: Optional[float] = None
+    lighter_price_source: str = "none"
 
     def best_funding_trade(self, notional_usd: float) -> Tuple[str, float, float]:
         """
@@ -338,6 +346,42 @@ def parse_lighter_last_trade_price(details_j: Dict[str, Any]) -> Optional[float]
     return None
 
 
+def extract_best_bid_ask(orders_j: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    if int(orders_j.get("code") or 0) != 200:
+        return (None, None)
+    bids = orders_j.get("bids") or []
+    asks = orders_j.get("asks") or []
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    for it in bids:
+        p = to_float((it or {}).get("price"))
+        if p is None or p <= 0:
+            continue
+        if best_bid is None or p > best_bid:
+            best_bid = p
+    for it in asks:
+        p = to_float((it or {}).get("price"))
+        if p is None or p <= 0:
+            continue
+        if best_ask is None or p < best_ask:
+            best_ask = p
+    if best_bid is not None and best_ask is not None and best_ask < best_bid:
+        return (None, None)
+    return (best_bid, best_ask)
+
+
+def choose_lighter_reference_price(
+    details_j: Dict[str, Any], orders_j: Dict[str, Any]
+) -> Tuple[Optional[float], str, Optional[float], Optional[float]]:
+    bid, ask = extract_best_bid_ask(orders_j)
+    if bid is not None and ask is not None and ask >= bid:
+        return (0.5 * (bid + ask), "orderbook_mid", bid, ask)
+    last = parse_lighter_last_trade_price(details_j)
+    if last is not None and last > 0:
+        return (last, "last_trade_fallback", None, None)
+    return (None, "none", None, None)
+
+
 def build_rows(
     var: Dict[str, Tuple[VenueRate, float, Optional[float]]],
     lighter_rates: Dict[str, VenueRate],
@@ -448,6 +492,18 @@ def main(argv: List[str]) -> int:
         help="How many top-ranked rows to fetch last_trade_price for (default: 30).",
     )
     ap.add_argument(
+        "--fetch-lighter-last-workers",
+        type=int,
+        default=8,
+        help="Concurrent workers for fetching Lighter price references (default: 8).",
+    )
+    ap.add_argument(
+        "--lighter-orderbookorders-limit",
+        type=int,
+        default=50,
+        help="Depth size for orderBookOrders (default: 50, max: 250).",
+    )
+    ap.add_argument(
         "--json",
         action="store_true",
         help="Output full ranking as JSON to stdout (instead of a table).",
@@ -521,20 +577,30 @@ def main(argv: List[str]) -> int:
     # Optional: fetch indicative prices only for the top-N ranked items.
     if args.fetch_lighter_last and args.fetch_lighter_last_limit > 0:
         need = ranked[: min(args.fetch_lighter_last_limit, len(ranked))]
-        by_mid: Dict[int, Optional[float]] = {}
-        for _net_1d, r, _strat, _funding_1d, _cost, _be in need:
-            if r.lighter_market_id in by_mid:
-                continue
-            url = LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=r.lighter_market_id)
-            dj = http_get_json(url, timeout_s=args.timeout)
-            by_mid[r.lighter_market_id] = parse_lighter_last_trade_price(dj)
+        by_mid: Dict[int, Tuple[Optional[float], str, Optional[float], Optional[float]]] = {}
+        orders_limit = max(1, min(250, int(args.lighter_orderbookorders_limit)))
+
+        ids = sorted({r.lighter_market_id for _net_1d, r, _s, _f, _c, _b in need if r.lighter_market_id > 0})
+
+        def _fetch_ref(mid: int) -> Tuple[int, Tuple[Optional[float], str, Optional[float], Optional[float]]]:
+            durl = LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=mid)
+            ourl = LIGHTER_ORDERBOOK_ORDERS_URL.format(market_id=mid, limit=orders_limit)
+            dj = http_get_json(durl, timeout_s=args.timeout)
+            oj = http_get_json(ourl, timeout_s=args.timeout)
+            return (mid, choose_lighter_reference_price(dj, oj))
+
+        with cf.ThreadPoolExecutor(max_workers=max(1, int(args.fetch_lighter_last_workers))) as ex:
+            futs = [ex.submit(_fetch_ref, mid) for mid in ids]
+            for fu in cf.as_completed(futs):
+                mid, ref = fu.result()
+                by_mid[mid] = ref
 
         # Update the ranked list rows in-place (via dataclasses.replace).
         updated_ranked: List[Tuple[float, MarketRow, str, float, float, float]] = []
         for net_1d, r, strat, funding_1d, cost, be in ranked:
-            last = by_mid.get(r.lighter_market_id)
+            last, src, bid, ask = by_mid.get(r.lighter_market_id, (None, "none", None, None))
             if is_reasonable_price_ratio(r.var_mid, last, args.min_price_ratio, args.max_price_ratio):
-                r = replace(r, lighter_last=last)
+                r = replace(r, lighter_last=last, lighter_price_source=src, lighter_bid=bid, lighter_ask=ask)
             updated_ranked.append((net_1d, r, strat, funding_1d, cost, be))
         ranked = updated_ranked
 
@@ -550,6 +616,7 @@ def main(argv: List[str]) -> int:
                 "var_fee_bps_per_trade": args.var_fee_bps,
                 "lighter_spread_bps_assumed_round_trip_excl_fees": args.lighter_spread_bps,
                 "lighter_funding_interval_s": args.lighter_funding_interval_s,
+                "lighter_orderbookorders_limit": int(max(1, min(250, int(args.lighter_orderbookorders_limit)))),
                 "net_1d_definition": "funding_pnl_over_1_day - estimated_round_trip_cost(open+close)",
                 "symbol_aliases": aliases,
                 "symbol_whitelist_size": len(symbol_whitelist),
@@ -570,7 +637,13 @@ def main(argv: List[str]) -> int:
                     "net_1d_usd": net_1d,
                     "breakeven_days": None if not math.isfinite(breakeven_days) else breakeven_days,
                     "basis_bps_indicative": basis_bps,
-                    "prices": {"var_mid": r.var_mid, "lighter_last_trade": r.lighter_last},
+                    "prices": {
+                        "var_mid": r.var_mid,
+                        "lighter_last_trade": r.lighter_last,
+                        "lighter_best_bid": r.lighter_bid,
+                        "lighter_best_ask": r.lighter_ask,
+                        "lighter_price_source": r.lighter_price_source,
+                    },
                     "var": {
                         "rate_frac_per_interval": r.var_rate.rate_frac_per_interval,
                         "interval_s": r.var_rate.interval_s,
@@ -616,7 +689,7 @@ def main(argv: List[str]) -> int:
     print("")
     print("说明:")
     print("- Lighter 的真实点差/滑点无法从这些公开接口直接得到；请用 --lighter-spread-bps 调整假设。")
-    print("- 参考基差(bps) 使用 Lighter 的 orderBookDetails.last_trade_price 计算，仅供参考(不是可成交 bid/ask)。")
+    print("- 参考基差(bps) 优先使用 orderBookOrders 的 best bid/ask 中间价，缺失时回退到 last_trade_price。")
     print("- 如果资金费率符号约定相反，请用 --funding-sign longs_receive。")
     return 0
 
