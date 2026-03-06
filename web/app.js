@@ -408,6 +408,7 @@ function drawChart(canvas, points, baselineBp) {
 
   const xmin = Math.min(...xs);
   const xmax = Math.max(...xs);
+  const spanS = Math.max(1, xmax - xmin);
   let ymin = Math.min(...valid);
   let ymax = Math.max(...valid);
 
@@ -476,15 +477,26 @@ function drawChart(canvas, points, baselineBp) {
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
   const gx = 6;
+
+  const fmtAxisTs = (tsSec) => {
+    const d = new Date(tsSec * 1000);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const mo = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    if (spanS >= 7 * 24 * 3600) return `${mo}-${dd}`;
+    if (spanS >= 24 * 3600) return `${mo}-${dd} ${hh}:${mm}`;
+    return `${hh}:${mm}`;
+  };
+
   for (let i = 0; i <= gx; i++) {
     const t = xmin + (i / gx) * (xmax - xmin);
     const x = xScale(t);
-    const d = new Date(t * 1000);
-    const lab = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const lab = fmtAxisTs(t);
     ctx.fillText(lab, x, padT + plotH + 14);
   }
 
-  return { xScale, yScale, padL, padT, plotW, plotH, xmin, xmax, ymin, ymax };
+  return { xScale, yScale, padL, padT, plotW, plotH, xmin, xmax, ymin, ymax, spanS };
 }
 
 async function loadHistory({ force = false } = {}) {
@@ -552,7 +564,10 @@ async function loadHistory({ force = false } = {}) {
         }
         if (best) {
           const d = new Date(best.ts * 1000);
-          const ts = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(
+          const ts = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(
+            2,
+            "0"
+          )} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(
             2,
             "0"
           )}:${String(d.getSeconds()).padStart(2, "0")}`;
