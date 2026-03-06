@@ -160,6 +160,18 @@ MODULE_RUN_LOCK = threading.Lock()
 WATCH: dict[str, dict] = {}
 WATCH_LOCK = threading.Lock()
 
+HISTORY_RANGE_MIN_S = 60
+HISTORY_RANGE_MAX_S = 7 * 24 * 3600
+HISTORY_LIMIT_MIN = 200
+HISTORY_LIMIT_MAX = 5000
+HISTORY_SOURCES = {"basis", "price_diff", "funding_basis"}
+HIST_SYMBOLS_RANGE_MIN_S = 3600
+HIST_SYMBOLS_RANGE_MAX_S = 90 * 24 * 3600
+HIST_SYMBOLS_LIMIT_MIN = 20
+HIST_SYMBOLS_LIMIT_MAX = 500
+HIST_SYMBOLS_MIN_POINTS_MIN = 1
+HIST_SYMBOLS_MIN_POINTS_MAX = 1000
+
 
 def _http_get_json(url: str, timeout_s: float) -> dict:
     import urllib.request
@@ -172,6 +184,50 @@ def _http_get_json(url: str, timeout_s: float) -> dict:
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         raw = resp.read()
     return json.loads(raw.decode("utf-8"))
+
+
+def normalize_history_query(range_s: int, limit: int) -> tuple[int, int]:
+    r = int(range_s)
+    l = int(limit)
+    if r < HISTORY_RANGE_MIN_S:
+        r = HISTORY_RANGE_MIN_S
+    if r > HISTORY_RANGE_MAX_S:
+        r = HISTORY_RANGE_MAX_S
+    if l < HISTORY_LIMIT_MIN:
+        l = HISTORY_LIMIT_MIN
+    if l > HISTORY_LIMIT_MAX:
+        l = HISTORY_LIMIT_MAX
+    return (r, l)
+
+
+def downsample_points(points: list[dict], max_points: int) -> list[dict]:
+    n = len(points)
+    if max_points <= 0 or n <= max_points:
+        return points
+    if max_points == 1:
+        return [points[-1]]
+    # Evenly sample across the whole window while preserving chronological order.
+    idxs = [(i * (n - 1)) // (max_points - 1) for i in range(max_points)]
+    return [points[i] for i in idxs]
+
+
+def normalize_history_symbols_query(range_s: int, limit: int, min_points: int) -> tuple[int, int, int]:
+    r = int(range_s)
+    l = int(limit)
+    m = int(min_points)
+    if r < HIST_SYMBOLS_RANGE_MIN_S:
+        r = HIST_SYMBOLS_RANGE_MIN_S
+    if r > HIST_SYMBOLS_RANGE_MAX_S:
+        r = HIST_SYMBOLS_RANGE_MAX_S
+    if l < HIST_SYMBOLS_LIMIT_MIN:
+        l = HIST_SYMBOLS_LIMIT_MIN
+    if l > HIST_SYMBOLS_LIMIT_MAX:
+        l = HIST_SYMBOLS_LIMIT_MAX
+    if m < HIST_SYMBOLS_MIN_POINTS_MIN:
+        m = HIST_SYMBOLS_MIN_POINTS_MIN
+    if m > HIST_SYMBOLS_MIN_POINTS_MAX:
+        m = HIST_SYMBOLS_MIN_POINTS_MAX
+    return (r, l, m)
 
 
 def _bps(var_mid: float | None, lighter_last: float | None) -> float | None:
@@ -464,31 +520,42 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/basis_history":
                 symbol = _qget(q, "symbol", "BTC").upper()
                 source = _qget(q, "source", "basis")
-                range_s = _qget_int(q, "range_s", 3600)
-                limit = _qget_int(q, "limit", 2000)
-                since = int(time.time()) - max(1, range_s)
+                range_s_raw = _qget_int(q, "range_s", 3600)
+                limit_raw = _qget_int(q, "limit", 2000)
+                range_s, limit = normalize_history_query(range_s_raw, limit_raw)
+                if source not in HISTORY_SOURCES:
+                    self._send_json(400, {"error": f"invalid source: {source}"})
+                    return
+                since = int(time.time()) - range_s
+                # Pull latest window first, then downsample to keep chart lightweight.
+                raw_limit = min(120000, max(limit * 20, 5000))
                 with DB_LOCK:
                     cur = DB.execute(
                         """
                         SELECT ts, bps, var_mid, lighter_last
                         FROM basis_samples
                         WHERE symbol=? AND source=? AND ts>=?
-                        ORDER BY ts ASC
+                        ORDER BY ts DESC
                         LIMIT ?
                         """,
-                        (symbol, source, since, limit),
+                        (symbol, source, since, raw_limit),
                     )
                     rows = cur.fetchall()
-                points = [
+                rows.reverse()
+                points_raw = [
                     {"ts": int(r[0]), "bps": r[1], "var_mid": r[2], "lighter_last": r[3]}
                     for r in rows
                 ]
+                points = downsample_points(points_raw, limit)
                 self._send_json(
                     200,
                     {
                         "symbol": symbol,
                         "source": source,
                         "range_s": range_s,
+                        "raw_points": len(points_raw),
+                        "points_returned": len(points),
+                        "downsampled": len(points_raw) > len(points),
                         "points": points,
                         "asof_unix": int(time.time()),
                     },
@@ -499,16 +566,68 @@ class Handler(BaseHTTPRequestHandler):
                 symbol = _qget(q, "symbol", "").upper()
                 on = _qget_bool(q, "on", True)
                 interval_s = _qget_float(q, "interval_s", 10.0)
+                replace = _qget_bool(q, "replace", False)
                 if not symbol:
                     self._send_json(400, {"error": "symbol required"})
                     return
                 with WATCH_LOCK:
                     if on:
+                        if replace:
+                            WATCH.clear()
                         WATCH[symbol] = {"interval_s": max(2.0, interval_s), "next_ts": 0.0}
                     else:
                         WATCH.pop(symbol, None)
                     active = sorted(WATCH.keys())
-                self._send_json(200, {"ok": True, "watching": active})
+                self._send_json(200, {"ok": True, "watching": active, "count": len(active)})
+                return
+
+            if u.path == "/api/history_symbols":
+                source = _qget(q, "source", "")
+                range_s_raw = _qget_int(q, "range_s", 30 * 24 * 3600)
+                limit_raw = _qget_int(q, "limit", 300)
+                min_points_raw = _qget_int(q, "min_points", 2)
+                range_s, limit, min_points = normalize_history_symbols_query(
+                    range_s=range_s_raw, limit=limit_raw, min_points=min_points_raw
+                )
+                if source and source not in HISTORY_SOURCES:
+                    self._send_json(400, {"error": f"invalid source: {source}"})
+                    return
+                since = int(time.time()) - range_s
+                params: list[object] = [since]
+                source_sql = ""
+                if source:
+                    source_sql = " AND source=? "
+                    params.append(source)
+                params.extend([min_points, limit])
+                with DB_LOCK:
+                    cur = DB.execute(
+                        f"""
+                        SELECT symbol, COUNT(*) AS c, MAX(ts) AS last_ts
+                        FROM basis_samples
+                        WHERE ts>=? {source_sql}
+                        GROUP BY symbol
+                        HAVING COUNT(*)>=?
+                        ORDER BY c DESC, last_ts DESC, symbol ASC
+                        LIMIT ?
+                        """,
+                        tuple(params),
+                    )
+                    rows = cur.fetchall()
+                symbols = [
+                    {"symbol": str(r[0]), "points": int(r[1]), "last_ts": int(r[2] or 0)}
+                    for r in rows
+                ]
+                self._send_json(
+                    200,
+                    {
+                        "source": source or "all",
+                        "range_s": range_s,
+                        "min_points": min_points,
+                        "symbols": symbols,
+                        "count": len(symbols),
+                        "asof_unix": int(time.time()),
+                    },
+                )
                 return
 
             if u.path == "/api/health":

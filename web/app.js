@@ -1,6 +1,10 @@
 /* global window, document */
 
 const $ = (id) => document.getElementById(id);
+let histWatchSymbol = null;
+let histWatchEnabled = false;
+let historyReqSeq = 0;
+let histSymbolsCache = { key: "", ts: 0, symbols: [] };
 
 function nowCN() {
   const d = new Date();
@@ -268,6 +272,7 @@ async function loadAll({ force = false } = {}) {
     const price = await fetchJSON(`/api/price?${qs2.toString()}`);
     renderFunding(funding);
     renderPrice(price);
+    refreshHistSymbolOptions({ force: false });
     updatedAt.textContent = nowCN();
   } catch (e) {
     updatedAt.textContent = "失败";
@@ -314,6 +319,24 @@ function pickSymbolFromTables() {
   return Array.from(set).slice(0, 200);
 }
 
+async function fetchHistSymbols(source, { force = false } = {}) {
+  const key = "all";
+  const now = Date.now();
+  if (!force && histSymbolsCache.key === key && now - histSymbolsCache.ts < 15000) {
+    return histSymbolsCache.symbols;
+  }
+  const qs = new URLSearchParams({
+    source: "",
+    range_s: String(30 * 24 * 3600),
+    limit: "300",
+    min_points: "1",
+  });
+  const j = await fetchJSON(`/api/history_symbols?${qs.toString()}`);
+  const syms = ((j && j.symbols) || []).map((x) => String(x.symbol || "").trim()).filter(Boolean);
+  histSymbolsCache = { key, ts: now, symbols: syms };
+  return syms;
+}
+
 function getHistRangeS() {
   const active = document.querySelector(".chip.active");
   const v = active ? Number(active.dataset.range || "86400") : 86400;
@@ -330,8 +353,27 @@ async function histWatch(symbol, on) {
     symbol,
     on: on ? "1" : "0",
     interval_s: "10",
+    replace: on ? "1" : "0",
   });
   await fetchJSON(`/api/watch?${qs.toString()}`);
+}
+
+async function syncHistWatch(symbol, on) {
+  if (!symbol) return;
+  if (on) {
+    if (histWatchEnabled && histWatchSymbol === symbol) return;
+    await histWatch(symbol, true);
+    histWatchEnabled = true;
+    histWatchSymbol = symbol;
+    return;
+  }
+  if (histWatchEnabled && histWatchSymbol) {
+    await histWatch(histWatchSymbol, false);
+  } else {
+    await histWatch(symbol, false);
+  }
+  histWatchEnabled = false;
+  histWatchSymbol = null;
 }
 
 function drawChart(canvas, points, baselineBp) {
@@ -446,15 +488,17 @@ function drawChart(canvas, points, baselineBp) {
 }
 
 async function loadHistory({ force = false } = {}) {
+  const reqSeq = ++historyReqSeq;
   const symbol = $("histSymbol").value || "BTC";
   const rangeS = getHistRangeS();
   const source = getHistSource();
   const baseline = Number(($("histBaseline").value || "0").trim());
   const baselineBp = Number.isFinite(baseline) ? baseline : 0;
+  const targetPoints = Math.min(5000, Math.max(1200, Math.floor(rangeS / 15)));
 
   const watchOn = $("histWatch").checked;
   try {
-    await histWatch(symbol, watchOn);
+    await syncHistWatch(symbol, watchOn);
   } catch (_) {
     // ignore
   }
@@ -463,11 +507,12 @@ async function loadHistory({ force = false } = {}) {
     symbol,
     source,
     range_s: String(rangeS),
-    limit: "2500",
+    limit: String(targetPoints),
   });
 
   try {
     const j = await fetchJSON(`/api/basis_history?${qs.toString()}`);
+    if (reqSeq !== historyReqSeq) return;
     const pts = (j && j.points) || [];
     const canvas = $("histCanvas");
     const meta = drawChart(canvas, pts, baselineBp);
@@ -483,7 +528,10 @@ async function loadHistory({ force = false } = {}) {
       last === null
         ? `${symbol} · 无数据`
         : `${symbol} · 最新 ${last.toFixed(2)}bp · 区间[${min.toFixed(2)}, ${max.toFixed(2)}]`;
-    $("histNote").textContent = `点数：${pts.length} · 数据源：${source} · 时间范围：${Math.round(rangeS / 60)} 分钟`;
+    const sampled = j.downsampled ? "（已下采样）" : "";
+    $("histNote").textContent = `点数：${pts.length}${sampled} · 数据源：${source} · 时间范围：${Math.round(
+      rangeS / 60
+    )} 分钟`;
 
     // Mouse hover for tip
     if (meta && meta.xScale) {
@@ -512,35 +560,55 @@ async function loadHistory({ force = false } = {}) {
           $("histTip").textContent = `${ts} · ${v.toFixed(2)}bp`;
         }
       };
+    } else {
+      canvas.onmousemove = null;
     }
   } catch (e) {
+    if (reqSeq !== historyReqSeq) return;
     $("histNote").textContent = `加载失败：${String(e.message || e)}`;
   }
 }
 
-function initHistory() {
-  // Populate symbols after initial load; retry a few times.
+async function refreshHistSymbolOptions({ force = false } = {}) {
   const sel = $("histSymbol");
-  const fill = () => {
-    const syms = pickSymbolFromTables();
-    if (!syms.length) return false;
-    const current = sel.value;
-    sel.innerHTML = "";
-    syms.forEach((s) => {
-      const opt = document.createElement("option");
-      opt.value = s;
-      opt.textContent = s;
-      sel.appendChild(opt);
-    });
-    if (current) sel.value = current;
-    return true;
-  };
+  const source = getHistSource();
+  let syms = [];
+  try {
+    syms = await fetchHistSymbols(source, { force });
+  } catch (_) {
+    // fallback to table-derived symbols
+    syms = [];
+  }
+  if (!syms.length) syms = pickSymbolFromTables();
+  if (!syms.length) return false;
+  const sig = syms.join(",");
+  const prevSig = sel.dataset.sig || "";
+  const current = sel.value;
+  if (sig === prevSig && current) return true;
+  sel.dataset.sig = sig;
+  sel.innerHTML = "";
+  syms.forEach((s) => {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    sel.appendChild(opt);
+  });
+  if (current && syms.includes(current)) {
+    sel.value = current;
+  } else if (histWatchSymbol && syms.includes(histWatchSymbol)) {
+    sel.value = histWatchSymbol;
+  } else {
+    sel.value = syms[0];
+  }
+  return true;
+}
 
-  let tries = 0;
-  const timer = window.setInterval(() => {
-    tries += 1;
-    if (fill() || tries > 10) window.clearInterval(timer);
-  }, 600);
+function initHistory() {
+  const sel = $("histSymbol");
+  // Keep symbol options in sync with the main tables.
+  window.setInterval(() => {
+    refreshHistSymbolOptions({ force: false });
+  }, 2000);
 
   document.querySelectorAll(".chip").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -556,7 +624,10 @@ function initHistory() {
     if (ev.key === "Enter") loadHistory({ force: true });
   });
   document.querySelectorAll("input[name='histSource']").forEach((el) => {
-    el.addEventListener("change", () => loadHistory({ force: true }));
+    el.addEventListener("change", async () => {
+      await refreshHistSymbolOptions({ force: true });
+      loadHistory({ force: true });
+    });
   });
   $("histWatch").addEventListener("change", () => loadHistory({ force: true }));
 
@@ -566,5 +637,6 @@ function initHistory() {
   }, 10 * 1000);
 
   // initial
+  window.setTimeout(() => refreshHistSymbolOptions({ force: true }), 300);
   window.setTimeout(() => loadHistory({ force: true }), 1200);
 }
