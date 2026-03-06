@@ -61,6 +61,77 @@ def norm_symbol(sym: str) -> str:
     return (sym or "").strip().upper()
 
 
+def canonical_symbol(sym: str, aliases: Optional[Dict[str, str]] = None) -> str:
+    s = norm_symbol(sym)
+    if not s:
+        return s
+    if aliases and s in aliases:
+        return norm_symbol(aliases[s])
+    return s
+
+
+def parse_symbol_aliases(raw: str) -> Dict[str, str]:
+    if not raw.strip():
+        return {}
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in obj.items():
+        ck = norm_symbol(str(k))
+        cv = norm_symbol(str(v))
+        if ck and cv:
+            out[ck] = cv
+    return out
+
+
+def build_symbol_whitelist(
+    var_symbols: List[str], lighter_symbols: List[str], aliases: Optional[Dict[str, str]] = None
+) -> set[str]:
+    var_set = {canonical_symbol(s, aliases) for s in var_symbols if canonical_symbol(s, aliases)}
+    lighter_set = {canonical_symbol(s, aliases) for s in lighter_symbols if canonical_symbol(s, aliases)}
+    return var_set & lighter_set
+
+
+def is_valid_lighter_market_spec(meta: Dict[str, Any]) -> bool:
+    if (meta.get("market_type") or "").lower() != "perp":
+        return False
+    if (meta.get("status") or "").lower() != "active":
+        return False
+    try:
+        market_id = int(meta.get("market_id") or 0)
+    except Exception:
+        market_id = 0
+    if market_id <= 0:
+        return False
+    min_base = to_float(meta.get("min_base_amount"))
+    min_quote = to_float(meta.get("min_quote_amount"))
+    if min_base is not None and min_base <= 0:
+        return False
+    if min_quote is not None and min_quote <= 0:
+        return False
+    return True
+
+
+def is_reasonable_price_ratio(
+    var_mid: Optional[float],
+    lighter_last: Optional[float],
+    min_ratio: float,
+    max_ratio: float,
+) -> bool:
+    if var_mid is None or lighter_last is None:
+        return False
+    if var_mid <= 0 or lighter_last <= 0:
+        return False
+    if min_ratio <= 0 or max_ratio <= 0 or min_ratio > max_ratio:
+        return True
+    ratio = var_mid / lighter_last
+    return min_ratio <= ratio <= max_ratio
+
+
 def bps_from_bid_ask(bid: float, ask: float) -> Optional[float]:
     if bid is None or ask is None:
         return None
@@ -148,7 +219,7 @@ class Row:
         return net_bps / 1e4 * self.名义本金
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Variational vs Lighter 差价套利(参考)排行榜(中文输出)")
     ap.add_argument("--名义本金", type=float, default=1000.0, help="每条腿名义本金(USD/USDT)，默认 1000")
     ap.add_argument(
@@ -178,18 +249,27 @@ def main() -> int:
         default=0.0,
         help="Variational 每笔 taker 手续费(bps)假设，默认 0",
     )
+    ap.add_argument(
+        "--symbol_aliases_json",
+        default="",
+        help='可选：符号别名映射JSON，例如 {"XBT":"BTC","BTC-PERP":"BTC"}',
+    )
+    ap.add_argument("--min_price_ratio", type=float, default=0.2, help="价格比下限(VAR_mid/L_last)，默认0.2")
+    ap.add_argument("--max_price_ratio", type=float, default=5.0, help="价格比上限(VAR_mid/L_last)，默认5.0")
     ap.add_argument("--显示前N", type=int, default=30, help="显示前 N 条，默认 30")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出(便于网页展示)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     t0 = time.time()
     var_j = http_get_json(VARIATIONAL_STATS_URL, timeout_s=args.超时)
     lighter_meta_j = http_get_json(LIGHTER_ORDERBOOKS_URL, timeout_s=args.超时)
 
+    aliases = parse_symbol_aliases(args.symbol_aliases_json)
+
     # 1) 解析 VAR：ticker -> bid/ask/mid/spread_bps
     var_map: Dict[str, Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]] = {}
     for it in (var_j.get("listings") or []):
-        sym = norm_symbol(it.get("ticker"))
+        sym = canonical_symbol(it.get("ticker"), aliases)
         if not sym:
             continue
         quotes = it.get("quotes") or {}
@@ -211,9 +291,9 @@ def main() -> int:
 
     lighter_markets: List[Tuple[str, int, float]] = []
     for it in (lighter_meta_j.get("order_books") or []):
-        if (it.get("market_type") or "").lower() != "perp":
+        if not is_valid_lighter_market_spec(it):
             continue
-        sym = norm_symbol(it.get("symbol"))
+        sym = canonical_symbol(it.get("symbol"), aliases)
         mid = int(it.get("market_id") or 0)
         if not sym or mid <= 0:
             continue
@@ -221,8 +301,9 @@ def main() -> int:
         taker_fee_bps = taker_fee_frac * 1e4
         lighter_markets.append((sym, mid, float(taker_fee_bps)))
 
+    symbol_whitelist = build_symbol_whitelist(list(var_map.keys()), [m[0] for m in lighter_markets], aliases)
     # 只保留 VAR 也有的标的
-    lighter_markets = [m for m in lighter_markets if m[0] in var_map]
+    lighter_markets = [m for m in lighter_markets if m[0] in symbol_whitelist]
     lighter_markets = lighter_markets[: max(0, args.最多市场数)]
 
     ensure_dir(args.缓存目录)
@@ -257,6 +338,8 @@ def main() -> int:
         bid, ask, var_mid, var_spread_bps = var_map.get(sym, (None, None, None, None))
         lighter_last = last_map.get(sym)
         if var_mid is None or lighter_last is None:
+            continue
+        if not is_reasonable_price_ratio(var_mid, lighter_last, args.min_price_ratio, args.max_price_ratio):
             continue
         diff = bps_diff(var_mid, lighter_last)  # VAR - Lighter
         if diff is None:
@@ -317,6 +400,9 @@ def main() -> int:
                 "cache_seconds": float(args.缓存秒),
                 "max_markets": int(args.最多市场数),
                 "concurrency": int(args.并发),
+                "symbol_aliases": aliases,
+                "symbol_whitelist_size": len(symbol_whitelist),
+                "price_ratio_guardrail": {"min": float(args.min_price_ratio), "max": float(args.max_price_ratio)},
             },
             "notes": [
                 "diff_bps uses VAR_mid vs Lighter last_trade_price (not executable bid/ask).",

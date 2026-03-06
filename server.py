@@ -14,23 +14,24 @@ Then open:
 from __future__ import annotations
 
 import json
+import io
 import os
-import subprocess
-import sys
 import time
 import threading
 import sqlite3
+from contextlib import redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+import arb_rank
+import price_arb_cn
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(ROOT, "web")
 DB_PATH = os.path.join(ROOT, "history.db")
-
-ARB_SCRIPT = os.path.join(ROOT, "arb_rank.py")
-PRICE_SCRIPT = os.path.join(ROOT, "price_arb_cn.py")
 
 VARIATIONAL_STATS_URL = (
     "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
@@ -71,22 +72,28 @@ def _qget_bool(q: dict, name: str, default: bool) -> bool:
     return default
 
 
-def _run_json(cmd: list[str], timeout_s: float) -> dict:
-    p = subprocess.run(
-        cmd,
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout_s,
-        check=False,
-    )
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip() or f"command failed: {cmd}")
+def _run_module_json(main_fn, argv: list[str], timeout_s: float) -> dict:
+    out = io.StringIO()
+    err = io.StringIO()
+
+    def _runner() -> int:
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = main_fn(argv)
+            return int(rc or 0)
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_runner)
+        try:
+            rc = fut.result(timeout=timeout_s)
+        except FuturesTimeoutError as e:
+            raise RuntimeError(f"command timeout after {timeout_s}s: {argv}") from e
+    if rc != 0:
+        raise RuntimeError(err.getvalue().strip() or f"command failed: {argv}")
+    raw = out.getvalue()
     try:
-        return json.loads(p.stdout)
+        return json.loads(raw)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Invalid JSON from {cmd}: {e}") from e
+        raise RuntimeError(f"Invalid JSON from module argv={argv}: {e}") from e
 
 
 def _db() -> sqlite3.Connection:
@@ -333,9 +340,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._send_json(200, cached)
                         return
 
-                cmd = [
-                    sys.executable,
-                    ARB_SCRIPT,
+                argv = [
                     "--json",
                     "--notional",
                     str(notional),
@@ -349,9 +354,9 @@ class Handler(BaseHTTPRequestHandler):
                     funding_sign,
                 ]
                 if fetch_last:
-                    cmd += ["--fetch-lighter-last", "--fetch-lighter-last-limit", str(fetch_limit)]
+                    argv += ["--fetch-lighter-last", "--fetch-lighter-last-limit", str(fetch_limit)]
 
-                data = _run_json(cmd, timeout_s=timeout_s)
+                data = _run_module_json(arb_rank.main, argv, timeout_s=timeout_s)
                 # Persist basis history for these items (if available).
                 ts = int(time.time())
                 rows = []
@@ -387,9 +392,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._send_json(200, cached)
                         return
 
-                cmd = [
-                    sys.executable,
-                    PRICE_SCRIPT,
+                argv = [
                     "--json",
                     "--名义本金",
                     str(notional),
@@ -406,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
                     "--缓存秒",
                     str(cache_seconds),
                 ]
-                data = _run_json(cmd, timeout_s=timeout_s)
+                data = _run_module_json(price_arb_cn.main, argv, timeout_s=timeout_s)
                 # Persist diff history for these items.
                 ts = int(time.time())
                 rows = []

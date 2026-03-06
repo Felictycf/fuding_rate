@@ -80,6 +80,77 @@ def norm_symbol(sym: str) -> str:
     return (sym or "").strip().upper()
 
 
+def canonical_symbol(sym: str, aliases: Optional[Dict[str, str]] = None) -> str:
+    s = norm_symbol(sym)
+    if not s:
+        return s
+    if aliases and s in aliases:
+        return norm_symbol(aliases[s])
+    return s
+
+
+def parse_symbol_aliases(raw: str) -> Dict[str, str]:
+    if not raw.strip():
+        return {}
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in obj.items():
+        ck = norm_symbol(str(k))
+        cv = norm_symbol(str(v))
+        if ck and cv:
+            out[ck] = cv
+    return out
+
+
+def build_symbol_whitelist(
+    var_symbols: Iterable[str], lighter_symbols: Iterable[str], aliases: Optional[Dict[str, str]] = None
+) -> set[str]:
+    var_set = {canonical_symbol(s, aliases) for s in var_symbols if canonical_symbol(s, aliases)}
+    lighter_set = {canonical_symbol(s, aliases) for s in lighter_symbols if canonical_symbol(s, aliases)}
+    return var_set & lighter_set
+
+
+def is_valid_lighter_market_spec(meta: Dict[str, Any]) -> bool:
+    if (meta.get("market_type") or "").lower() != "perp":
+        return False
+    if (meta.get("status") or "").lower() != "active":
+        return False
+    try:
+        market_id = int(meta.get("market_id") or 0)
+    except Exception:
+        market_id = 0
+    if market_id <= 0:
+        return False
+    min_base = to_float(meta.get("min_base_amount"))
+    min_quote = to_float(meta.get("min_quote_amount"))
+    if min_base is not None and min_base <= 0:
+        return False
+    if min_quote is not None and min_quote <= 0:
+        return False
+    return True
+
+
+def is_reasonable_price_ratio(
+    var_mid: Optional[float],
+    lighter_last: Optional[float],
+    min_ratio: float,
+    max_ratio: float,
+) -> bool:
+    if var_mid is None or lighter_last is None:
+        return False
+    if var_mid <= 0 or lighter_last <= 0:
+        return False
+    if min_ratio <= 0 or max_ratio <= 0 or min_ratio > max_ratio:
+        return True
+    ratio = var_mid / lighter_last
+    return min_ratio <= ratio <= max_ratio
+
+
 def fmt(x: Optional[float], nd: int = 6) -> str:
     if x is None:
         return "-"
@@ -272,18 +343,19 @@ def build_rows(
     lighter_rates: Dict[str, VenueRate],
     lighter_meta: Dict[str, Dict[str, Any]],
     lighter_spread_bps_assumed: float,
+    symbol_whitelist: Optional[set[str]] = None,
 ) -> List[MarketRow]:
     rows: List[MarketRow] = []
     for sym, (vr, var_rt_bps, var_mid) in var.items():
+        if symbol_whitelist is not None and sym not in symbol_whitelist:
+            continue
         lr = lighter_rates.get(sym)
         meta = lighter_meta.get(sym)
         if lr is None or meta is None:
             continue
-        if (meta.get("market_type") or "").lower() != "perp":
+        if not is_valid_lighter_market_spec(meta):
             continue
         mid = int(meta.get("market_id") or 0)
-        if mid <= 0:
-            continue
         # Lighter fees are returned as strings like "0.0000" (fractional). Convert to bps.
         taker_fee_frac = to_float(meta.get("taker_fee")) or 0.0
         taker_fee_bps = taker_fee_frac * 1e4
@@ -380,6 +452,23 @@ def main(argv: List[str]) -> int:
         action="store_true",
         help="Output full ranking as JSON to stdout (instead of a table).",
     )
+    ap.add_argument(
+        "--symbol-aliases-json",
+        default="",
+        help='Optional symbol alias mapping JSON, e.g. {"XBT":"BTC","BTC-PERP":"BTC"}',
+    )
+    ap.add_argument(
+        "--min-price-ratio",
+        type=float,
+        default=0.2,
+        help="Filter out indicative price pairs with VAR_mid/Lighter_last below this ratio (default: 0.2).",
+    )
+    ap.add_argument(
+        "--max-price-ratio",
+        type=float,
+        default=5.0,
+        help="Filter out indicative price pairs with VAR_mid/Lighter_last above this ratio (default: 5.0).",
+    )
 
     args = ap.parse_args(argv)
     pos_means_longs_pay = args.funding_sign == "longs_pay"
@@ -403,12 +492,19 @@ def main(argv: List[str]) -> int:
         pos_means_longs_pay=pos_means_longs_pay,
     )
     lighter_meta = parse_lighter_orderbooks_meta(lighter_meta_j)
+    aliases = parse_symbol_aliases(args.symbol_aliases_json)
+    if aliases:
+        var = {canonical_symbol(k, aliases): v for k, v in var.items()}
+        lighter_rates = {canonical_symbol(k, aliases): v for k, v in lighter_rates.items()}
+        lighter_meta = {canonical_symbol(k, aliases): v for k, v in lighter_meta.items()}
+    symbol_whitelist = build_symbol_whitelist(var.keys(), lighter_rates.keys(), aliases=aliases)
 
     rows = build_rows(
         var=var,
         lighter_rates=lighter_rates,
         lighter_meta=lighter_meta,
         lighter_spread_bps_assumed=args.lighter_spread_bps,
+        symbol_whitelist=symbol_whitelist,
     )
 
     ranked: List[Tuple[float, MarketRow, str, float, float, float]] = []
@@ -437,7 +533,7 @@ def main(argv: List[str]) -> int:
         updated_ranked: List[Tuple[float, MarketRow, str, float, float, float]] = []
         for net_1d, r, strat, funding_1d, cost, be in ranked:
             last = by_mid.get(r.lighter_market_id)
-            if last is not None:
+            if is_reasonable_price_ratio(r.var_mid, last, args.min_price_ratio, args.max_price_ratio):
                 r = replace(r, lighter_last=last)
             updated_ranked.append((net_1d, r, strat, funding_1d, cost, be))
         ranked = updated_ranked
@@ -455,6 +551,9 @@ def main(argv: List[str]) -> int:
                 "lighter_spread_bps_assumed_round_trip_excl_fees": args.lighter_spread_bps,
                 "lighter_funding_interval_s": args.lighter_funding_interval_s,
                 "net_1d_definition": "funding_pnl_over_1_day - estimated_round_trip_cost(open+close)",
+                "symbol_aliases": aliases,
+                "symbol_whitelist_size": len(symbol_whitelist),
+                "price_ratio_guardrail": {"min": args.min_price_ratio, "max": args.max_price_ratio},
             },
             "items": [],
             "fetch_ms": int((time.time() - t0) * 1000),

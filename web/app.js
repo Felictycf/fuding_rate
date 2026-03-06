@@ -286,10 +286,10 @@ function init() {
 
   loadAll({ force: true });
 
-  // 5分钟自动刷新
+  // 10秒自动刷新
   window.setInterval(() => {
     loadAll({ force: false });
-  }, 5 * 60 * 1000);
+  }, 10 * 1000);
 
   initHistory();
 }
@@ -558,10 +558,10 @@ function initHistory() {
   });
   $("histWatch").addEventListener("change", () => loadHistory({ force: true }));
 
-  // periodic refresh (chart) every 15s; sampling runs server-side if enabled.
+  // periodic refresh (chart) every 10s; sampling runs server-side if enabled.
   window.setInterval(() => {
     loadHistory({ force: false });
-  }, 15 * 1000);
+  }, 10 * 1000);
 
   // initial
   window.setTimeout(() => loadHistory({ force: true }), 1200);
