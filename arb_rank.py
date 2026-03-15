@@ -22,10 +22,11 @@ import json
 import math
 import sys
 import time
-import urllib.request
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from http_json import get_json
 
 
 VARIATIONAL_STATS_URL = (
@@ -42,17 +43,7 @@ LIGHTER_ORDERBOOK_ORDERS_URL = (
 
 
 def http_get_json(url: str, timeout_s: float = 20.0) -> Any:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "arb-ranker/1.0 (+https://local)",
-        },
-        method="GET",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        raw = resp.read()
-    return json.loads(raw.decode("utf-8"))
+    return get_json(url, timeout_s=timeout_s, user_agent="arb-ranker/1.0 (+https://local)")
 
 
 def to_float(x: Any) -> Optional[float]:

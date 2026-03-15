@@ -1,4 +1,6 @@
+import time
 import unittest
+from unittest import mock
 
 import server
 
@@ -31,6 +33,81 @@ class HistoryHelperTests(unittest.TestCase):
     def test_normalize_history_symbols_query_nominal(self):
         r, l, m = server.normalize_history_symbols_query(range_s=86400, limit=120, min_points=5)
         self.assertEqual((r, l, m), (86400, 120, 5))
+
+    def test_take_rotating_batch_wraps(self):
+        symbols = ["BTC", "DOGE", "SOL", "ETH"]
+        batch, cursor = server.take_rotating_batch(symbols, cursor=3, batch_size=3)
+        self.assertEqual(batch, ["ETH", "BTC", "DOGE"])
+        self.assertEqual(cursor, 2)
+
+    def test_intersect_collector_symbols(self):
+        var_symbols = ["BTC", "DOGE", "SOL", "XRP"]
+        lighter_map = {"DOGE": 10, "BTC": 1, "ETH": 2}
+        out = server.intersect_collector_symbols(var_symbols, lighter_map)
+        self.assertEqual(out, ["BTC", "DOGE"])
+
+
+class SnapshotHelperTests(unittest.TestCase):
+    def setUp(self):
+        server.SNAPSHOTS = {"funding": {}, "price": {}}
+
+    def test_seed_snapshot_targets_registers_default_dashboard_queries(self):
+        server.seed_snapshot_targets()
+        self.assertEqual(len(server.SNAPSHOTS["funding"]), 1)
+        self.assertEqual(len(server.SNAPSHOTS["price"]), 1)
+        funding_entry = next(iter(server.SNAPSHOTS["funding"].values()))
+        price_entry = next(iter(server.SNAPSHOTS["price"].values()))
+        self.assertEqual(funding_entry["params"]["top"], 30)
+        self.assertEqual(price_entry["params"]["top"], 30)
+
+    def test_resolve_snapshot_payload_prefers_recent_snapshot(self):
+        key = "funding|default"
+        server.SNAPSHOTS["funding"][key] = {
+            "params": {"top": 30},
+            "data": {"items": [{"symbol": "BTC"}], "fetch_ms": 3200},
+            "updated_at": time.time() - 0.2,
+            "last_access": 0.0,
+            "last_error": None,
+        }
+        live_fetcher = mock.Mock(side_effect=AssertionError("should not fetch live"))
+
+        out = server.resolve_snapshot_payload(
+            "funding",
+            key,
+            {"top": 30},
+            force=False,
+            snapshot_max_age_s=5.0,
+            live_fetcher=live_fetcher,
+        )
+
+        self.assertEqual(out["source"], "snapshot")
+        self.assertEqual(out["items"][0]["symbol"], "BTC")
+        self.assertIn("snapshot_age_ms", out)
+        live_fetcher.assert_not_called()
+
+    def test_resolve_snapshot_payload_force_live_bypasses_snapshot(self):
+        key = "funding|default"
+        server.SNAPSHOTS["funding"][key] = {
+            "params": {"top": 30},
+            "data": {"items": [{"symbol": "BTC"}], "fetch_ms": 3200},
+            "updated_at": time.time(),
+            "last_access": 0.0,
+            "last_error": None,
+        }
+        live_fetcher = mock.Mock(return_value={"items": [{"symbol": "ETH"}], "fetch_ms": 111})
+
+        out = server.resolve_snapshot_payload(
+            "funding",
+            key,
+            {"top": 30},
+            force=True,
+            snapshot_max_age_s=5.0,
+            live_fetcher=live_fetcher,
+        )
+
+        self.assertEqual(out["source"], "live")
+        self.assertEqual(out["items"][0]["symbol"], "ETH")
+        live_fetcher.assert_called_once()
 
 
 if __name__ == "__main__":

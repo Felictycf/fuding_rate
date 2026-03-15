@@ -19,9 +19,10 @@ import json
 import math
 import os
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+from http_json import get_json
 
 
 VARIATIONAL_STATS_URL = (
@@ -37,14 +38,7 @@ LIGHTER_ORDERBOOK_ORDERS_URL = (
 
 
 def http_get_json(url: str, timeout_s: float = 20.0) -> Any:
-    req = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "price-arb-cn/1.0"},
-        method="GET",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        raw = resp.read()
-    return json.loads(raw.decode("utf-8"))
+    return get_json(url, timeout_s=timeout_s, user_agent="price-arb-cn/1.0")
 
 
 def to_float(x: Any) -> Optional[float]:

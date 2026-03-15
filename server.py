@@ -19,7 +19,6 @@ import os
 import time
 import threading
 import sqlite3
-import statistics
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from http import HTTPStatus
@@ -27,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import arb_rank
+from http_json import get_json
 import price_arb_cn
 
 
@@ -193,6 +193,10 @@ MODULE_RUN_LOCK = threading.Lock()
 
 WATCH: dict[str, dict] = {}
 WATCH_LOCK = threading.Lock()
+COLLECTOR_INTERVAL_S = max(5.0, float(os.environ.get("COLLECTOR_INTERVAL_S", "10")))
+COLLECTOR_BATCH_SIZE = max(1, int(os.environ.get("COLLECTOR_BATCH_SIZE", "12")))
+COLLECTOR_SYMBOL_REFRESH_S = max(30.0, float(os.environ.get("COLLECTOR_SYMBOL_REFRESH_S", "300")))
+COLLECTOR_WORKERS = max(1, int(os.environ.get("COLLECTOR_WORKERS", "8")))
 
 HISTORY_RANGE_MIN_S = 60
 HISTORY_RANGE_MAX_S = 7 * 24 * 3600
@@ -208,16 +212,7 @@ HIST_SYMBOLS_MIN_POINTS_MAX = 1000
 
 
 def _http_get_json(url: str, timeout_s: float) -> dict:
-    import urllib.request
-
-    req = urllib.request.Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "arb-dashboard/1.0"},
-        method="GET",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        raw = resp.read()
-    return json.loads(raw.decode("utf-8"))
+    return get_json(url, timeout_s=timeout_s, user_agent="arb-dashboard/1.0")
 
 
 def normalize_history_query(range_s: int, limit: int) -> tuple[int, int]:
@@ -273,6 +268,22 @@ def normalize_min_quote_points(min_quote_points: int) -> int:
     return m
 
 
+def take_rotating_batch(symbols: list[str], cursor: int, batch_size: int) -> tuple[list[str], int]:
+    if not symbols:
+        return ([], 0)
+    n = len(symbols)
+    size = max(1, min(int(batch_size), n))
+    start = int(cursor) % n
+    out = [symbols[(start + i) % n] for i in range(size)]
+    return (out, (start + size) % n)
+
+
+def intersect_collector_symbols(var_symbols: list[str], lighter_map: dict[str, int]) -> list[str]:
+    lighter_symbols = {str(sym).upper() for sym, mid in lighter_map.items() if int(mid or 0) > 0}
+    common = {str(sym).upper() for sym in var_symbols if str(sym).upper() in lighter_symbols}
+    return sorted(common)
+
+
 def _bps(var_mid: float | None, lighter_last: float | None) -> float | None:
     if not var_mid or not lighter_last or var_mid <= 0 or lighter_last <= 0:
         return None
@@ -280,62 +291,6 @@ def _bps(var_mid: float | None, lighter_last: float | None) -> float | None:
     if mid <= 0:
         return None
     return (var_mid - lighter_last) / mid * 1e4
-
-
-def _spread_bps(bid: float | None, ask: float | None) -> float | None:
-    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
-        return None
-    m = 0.5 * (bid + ask)
-    if m <= 0:
-        return None
-    return (ask - bid) / m * 1e4
-
-
-def _quote_from_mid(mid: float | None, spread_bps: float | None) -> tuple[float | None, float | None]:
-    if mid is None or mid <= 0:
-        return (None, None)
-    s = float(spread_bps or 0.0)
-    if s < 0:
-        s = 0.0
-    half = s / 20000.0
-    return (mid * (1.0 - half), mid * (1.0 + half))
-
-
-def _infer_symbol_spreads(
-    symbol: str, source: str, since_ts: int | None = None
-) -> tuple[float | None, float | None]:
-    params: list[object] = [symbol, source]
-    since_sql = ""
-    if since_ts is not None and since_ts > 0:
-        since_sql = " AND ts>=? "
-        params.append(int(since_ts))
-    with DB_LOCK:
-        cur = DB.execute(
-            f"""
-            SELECT var_bid, var_ask, lighter_bid, lighter_ask
-            FROM basis_samples
-            WHERE symbol=? AND source=? {since_sql}
-              AND var_bid IS NOT NULL AND var_ask IS NOT NULL
-              AND lighter_bid IS NOT NULL AND lighter_ask IS NOT NULL
-            ORDER BY ts DESC
-            LIMIT 500
-            """,
-            tuple(params),
-        )
-        rows = cur.fetchall()
-
-    v_spreads: list[float] = []
-    l_spreads: list[float] = []
-    for vb, va, lb, la in rows:
-        vs = _spread_bps(vb, va)
-        ls = _spread_bps(lb, la)
-        if vs is not None and vs >= 0:
-            v_spreads.append(vs)
-        if ls is not None and ls >= 0:
-            l_spreads.append(ls)
-    var_s = statistics.median(v_spreads) if v_spreads else None
-    lighter_s = statistics.median(l_spreads) if l_spreads else None
-    return (var_s, lighter_s)
 
 
 _VAR_CACHE: tuple[float, dict] | None = None
@@ -377,6 +332,22 @@ def _get_var_quote(symbol: str, timeout_s: float = 10.0) -> tuple[float | None, 
                 return (bid, ask, v)
             return (bid, ask, None)
     return (None, None, None)
+
+
+def _get_var_symbols(timeout_s: float = 10.0) -> list[str]:
+    global _VAR_CACHE
+    now = time.time()
+    if _VAR_CACHE and (now - _VAR_CACHE[0]) < 5.0:
+        j = _VAR_CACHE[1]
+    else:
+        j = _http_get_json(VARIATIONAL_STATS_URL, timeout_s=timeout_s)
+        _VAR_CACHE = (now, j)
+    out: list[str] = []
+    for it in j.get("listings", []) or []:
+        sym = str(it.get("ticker") or "").upper()
+        if sym:
+            out.append(sym)
+    return out
 
 
 def _get_var_mid(symbol: str, timeout_s: float = 10.0) -> float | None:
@@ -498,6 +469,7 @@ def _sampler_loop() -> None:
                 b = _bps(var_mid, lighter_last)
                 ts = int(now)
                 rows.append((ts, sym, "basis", var_mid, lighter_last, b, var_bid, var_ask, lighter_bid, lighter_ask))
+                rows.append((ts, sym, "price_diff", var_mid, lighter_last, b, var_bid, var_ask, lighter_bid, lighter_ask))
             except Exception:
                 # Ignore and retry next tick
                 pass
@@ -505,6 +477,50 @@ def _sampler_loop() -> None:
             with WATCH_LOCK:
                 WATCH[sym] = cfg
         _db_insert_many(rows)
+
+
+def _collector_rows_for_symbol(symbol: str, ts: int) -> list[tuple[int, str, str, float | None, float | None, float | None, float | None, float | None, float | None, float | None]]:
+    var_bid, var_ask, var_mid = _get_var_quote(symbol, timeout_s=10.0)
+    lighter_bid, lighter_ask, lighter_last = _get_lighter_quote(symbol, timeout_s=10.0)
+    if any(x is None for x in (var_bid, var_ask, lighter_bid, lighter_ask)):
+        return []
+    basis_bps = _bps(var_mid, lighter_last)
+    return [
+        (ts, symbol, "basis", var_mid, lighter_last, basis_bps, var_bid, var_ask, lighter_bid, lighter_ask),
+        (ts, symbol, "price_diff", var_mid, lighter_last, basis_bps, var_bid, var_ask, lighter_bid, lighter_ask),
+    ]
+
+
+def _collector_loop() -> None:
+    # Long-running real quote collector for common VAR/Lighter symbols.
+    symbols: list[str] = []
+    cursor = 0
+    last_refresh = 0.0
+    while True:
+        now = time.time()
+        if not symbols or (now - last_refresh) >= COLLECTOR_SYMBOL_REFRESH_S:
+            try:
+                symbols = intersect_collector_symbols(_get_var_symbols(timeout_s=10.0), _get_lighter_market_map(timeout_s=10.0))
+                last_refresh = now
+                cursor = 0 if cursor >= len(symbols) else cursor
+            except Exception:
+                time.sleep(5.0)
+                continue
+        batch, cursor = take_rotating_batch(symbols, cursor, COLLECTOR_BATCH_SIZE)
+        if not batch:
+            time.sleep(5.0)
+            continue
+        ts = int(now)
+        rows: list[tuple[int, str, str, float | None, float | None, float | None, float | None, float | None, float | None, float | None]] = []
+        with ThreadPoolExecutor(max_workers=min(COLLECTOR_WORKERS, len(batch))) as ex:
+            futs = [ex.submit(_collector_rows_for_symbol, sym, ts) for sym in batch]
+            for fut in futs:
+                try:
+                    rows.extend(fut.result())
+                except Exception:
+                    continue
+        _db_insert_many(rows)
+        time.sleep(COLLECTOR_INTERVAL_S)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -534,9 +550,6 @@ class Handler(BaseHTTPRequestHandler):
     def _history_row_to_point(
         self,
         r: tuple,
-        fill_quotes: bool,
-        est_var_spread_bps: float | None,
-        est_lighter_spread_bps: float | None,
     ) -> dict:
         ts = int(r[0])
         bps = r[1]
@@ -546,25 +559,6 @@ class Handler(BaseHTTPRequestHandler):
         var_ask = r[5]
         lighter_bid = r[6]
         lighter_ask = r[7]
-        has_raw = all(x is not None for x in (var_bid, var_ask, lighter_bid, lighter_ask))
-
-        quote_mode = "raw" if has_raw else "none"
-        if fill_quotes and not has_raw:
-            if var_bid is None or var_ask is None:
-                vb, va = _quote_from_mid(var_mid, est_var_spread_bps)
-                if var_bid is None:
-                    var_bid = vb
-                if var_ask is None:
-                    var_ask = va
-            if lighter_bid is None or lighter_ask is None:
-                lb, la = _quote_from_mid(lighter_last, est_lighter_spread_bps)
-                if lighter_bid is None:
-                    lighter_bid = lb
-                if lighter_ask is None:
-                    lighter_ask = la
-            if all(x is not None for x in (var_bid, var_ask, lighter_bid, lighter_ask)):
-                quote_mode = "estimated"
-
         has_dual = all(x is not None for x in (var_bid, var_ask, lighter_bid, lighter_ask))
         return {
             "ts": ts,
@@ -576,7 +570,7 @@ class Handler(BaseHTTPRequestHandler):
             "lighter_bid": lighter_bid,
             "lighter_ask": lighter_ask,
             "has_dual_quotes": has_dual,
-            "quote_mode": quote_mode if has_dual else "none",
+            "quote_mode": "raw" if has_dual else "none",
         }
 
     def do_GET(self) -> None:
@@ -738,7 +732,6 @@ class Handler(BaseHTTPRequestHandler):
                 source = _qget(q, "source", "basis")
                 range_s_raw = _qget_int(q, "range_s", 3600)
                 limit_raw = _qget_int(q, "limit", 2000)
-                fill_quotes = _qget_bool(q, "fill_quotes", True)
                 range_s, limit = normalize_history_query(range_s_raw, limit_raw)
                 if source not in HISTORY_SOURCES:
                     self._send_json(400, {"error": f"invalid source: {source}"})
@@ -759,46 +752,14 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     rows = cur.fetchall()
                 rows.reverse()
-                # For old rows that only have mid/last, estimate bid/ask using median spreads
-                # from recent quoted history, falling back to current live spread if needed.
-                est_var_spread_bps: float | None = None
-                est_lighter_spread_bps: float | None = None
-                if fill_quotes:
-                    est_var_spread_bps, est_lighter_spread_bps = _infer_symbol_spreads(
-                        symbol=symbol, source=source, since_ts=since - 7 * 24 * 3600
-                    )
-                    if est_var_spread_bps is None or est_lighter_spread_bps is None:
-                        try:
-                            vb, va, _vm = _get_var_quote(symbol, timeout_s=6.0)
-                            lb, la, _lm = _get_lighter_quote(symbol, timeout_s=6.0)
-                            if est_var_spread_bps is None:
-                                est_var_spread_bps = _spread_bps(vb, va)
-                            if est_lighter_spread_bps is None:
-                                est_lighter_spread_bps = _spread_bps(lb, la)
-                        except Exception:
-                            pass
-                    if est_var_spread_bps is None:
-                        est_var_spread_bps = 10.0
-                    if est_lighter_spread_bps is None:
-                        est_lighter_spread_bps = 12.0
-
                 raw_quote_points = 0
-                estimated_quote_points = 0
                 points_raw = [
-                    self._history_row_to_point(
-                        r=r,
-                        fill_quotes=fill_quotes,
-                        est_var_spread_bps=est_var_spread_bps,
-                        est_lighter_spread_bps=est_lighter_spread_bps,
-                    )
+                    self._history_row_to_point(r=r)
                     for r in rows
                 ]
                 for p in points_raw:
-                    if p.get("has_dual_quotes"):
-                        if p.get("quote_mode") == "raw":
-                            raw_quote_points += 1
-                        elif p.get("quote_mode") == "estimated":
-                            estimated_quote_points += 1
+                    if p.get("quote_mode") == "raw":
+                        raw_quote_points += 1
                 points = downsample_points(points_raw, limit)
                 self._send_json(
                     200,
@@ -809,11 +770,7 @@ class Handler(BaseHTTPRequestHandler):
                         "raw_points": len(points_raw),
                         "points_returned": len(points),
                         "downsampled": len(points_raw) > len(points),
-                        "fill_quotes": fill_quotes,
                         "raw_quote_points": raw_quote_points,
-                        "estimated_quote_points": estimated_quote_points,
-                        "est_var_spread_bps": est_var_spread_bps,
-                        "est_lighter_spread_bps": est_lighter_spread_bps,
                         "points": points,
                         "asof_unix": int(time.time()),
                     },
@@ -996,9 +953,14 @@ def main() -> int:
         raise SystemExit(f"Missing web dir: {WEB_DIR}")
     th = threading.Thread(target=_sampler_loop, name="basis-sampler", daemon=True)
     th.start()
+    collector = threading.Thread(target=_collector_loop, name="history-collector", daemon=True)
+    collector.start()
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"Dashboard: http://{host}:{port}")
     print("API: /api/funding , /api/price")
+    print(
+        f"Collector: enabled interval={COLLECTOR_INTERVAL_S:.1f}s batch={COLLECTOR_BATCH_SIZE} workers={COLLECTOR_WORKERS}"
+    )
     httpd.serve_forever()
     return 0
 
