@@ -5,6 +5,7 @@ let histWatchSymbol = null;
 let histWatchEnabled = false;
 let historyReqSeq = 0;
 let histSymbolsCache = { key: "", ts: 0, symbols: [] };
+let tableReqSeq = 0;
 
 function nowCN() {
   const d = new Date();
@@ -47,7 +48,74 @@ function renderLatencyNote(prefix, count, payload) {
   if (payload?.fetch_ms !== undefined && payload?.fetch_ms !== null) {
     parts.push(`最近计算：${payload.fetch_ms} ms`);
   }
+  if (payload?.lighter_ws_subscribed !== undefined) {
+    const covered = Number(payload?.lighter_ws_covered || 0);
+    const subscribed = Number(payload?.lighter_ws_subscribed || 0);
+    parts.push(`WS覆盖：${covered}/${subscribed}`);
+    if (payload?.lighter_ws_age_ms !== undefined && payload?.lighter_ws_age_ms !== null) {
+      parts.push(`WS年龄：${fmtAgeMs(payload.lighter_ws_age_ms)}`);
+    }
+    if (payload?.lighter_ws_fallback_count !== undefined && payload?.lighter_ws_fallback_count !== null) {
+      parts.push(`REST回退：${payload.lighter_ws_fallback_count}`);
+    }
+  }
   prefix.textContent = `${parts.join("。")}。`;
+}
+
+function latencyBadgeText(label, payload) {
+  if (!payload) return `${label}: 等待中`;
+  const source = payload.source === "live" ? "实时" : "快照";
+  const age = payload.snapshot_age_ms !== undefined ? fmtAgeMs(payload.snapshot_age_ms) : "未知";
+  const parts = [`${label}: ${source} ${age}`];
+  if (payload?.lighter_ws_subscribed !== undefined) {
+    parts.push(`WS ${Number(payload?.lighter_ws_covered || 0)}/${Number(payload?.lighter_ws_subscribed || 0)}`);
+    if (payload?.lighter_ws_age_ms !== undefined && payload?.lighter_ws_age_ms !== null) {
+      parts.push(fmtAgeMs(payload.lighter_ws_age_ms));
+    }
+  }
+  return parts.join(" | ");
+}
+
+function setLatencyBadges(prefix, fastPayload, detailPayload) {
+  $(`${prefix}FastMeta`).textContent = latencyBadgeText("主", fastPayload);
+  if (!detailPayload) {
+    $(`${prefix}DetailMeta`).textContent = "明细: 补充中";
+    return;
+  }
+  const stale = detailPayload.snapshot_stale ? " 兜底" : "";
+  $(`${prefix}DetailMeta`).textContent = `${latencyBadgeText("明细", detailPayload)}${stale}`;
+}
+
+function mergeValue(base, detail) {
+  if (Array.isArray(base) || Array.isArray(detail)) return detail !== undefined ? detail : base;
+  if (detail === null || detail === undefined) return base;
+  if (
+    base &&
+    detail &&
+    typeof base === "object" &&
+    typeof detail === "object" &&
+    !Array.isArray(base) &&
+    !Array.isArray(detail)
+  ) {
+    const out = { ...base };
+    Object.keys(detail).forEach((key) => {
+      out[key] = mergeValue(base[key], detail[key]);
+    });
+    return out;
+  }
+  return detail;
+}
+
+function mergeItemsBySymbol(fastPayload, detailPayload) {
+  if (!fastPayload) return detailPayload;
+  if (!detailPayload || !Array.isArray(detailPayload.items)) return fastPayload;
+  const detailMap = new Map(detailPayload.items.map((it) => [String(it.symbol || ""), it]));
+  const mergedItems = (fastPayload.items || []).map((it) => {
+    const sym = String(it.symbol || "");
+    const detail = detailMap.get(sym);
+    return detail ? mergeValue(it, detail) : it;
+  });
+  return { ...fastPayload, items: mergedItems };
 }
 
 function badgeForValue(v) {
@@ -96,7 +164,7 @@ function buildParams() {
   };
 }
 
-function renderFunding(j) {
+function renderFunding(j, detailPayload = null) {
   const tbody = $("fundingBody");
   clearTbody(tbody);
 
@@ -173,10 +241,11 @@ function renderFunding(j) {
   });
 
   const note = $("fundingNote");
-  renderLatencyNote(note, items.length, j);
+  setLatencyBadges("funding", j, detailPayload);
+  renderLatencyNote(note, items.length, detailPayload || j);
 }
 
-function renderPrice(j) {
+function renderPrice(j, detailPayload = null) {
   const tbody = $("priceBody");
   clearTbody(tbody);
 
@@ -252,50 +321,96 @@ function renderPrice(j) {
   });
 
   const note = $("priceNote");
-  renderLatencyNote(note, items.length, j);
+  setLatencyBadges("price", j, detailPayload);
+  renderLatencyNote(note, items.length, detailPayload || j);
 }
 
 async function loadAll({ force = false } = {}) {
+  const reqSeq = ++tableReqSeq;
   const p = buildParams();
   const fundingFetchLimit = Math.max(1, Math.min(p.top, 8));
   const priceMaxMarkets = Math.max(20, Math.min(40, p.top * 2));
   const updatedAt = $("updatedAt");
   updatedAt.textContent = "刷新中…";
 
-  const qs = new URLSearchParams({
+  const fundingFastQs = new URLSearchParams({
     notional: String(p.notional),
     top: String(p.top),
     lighter_spread_bps: String(p.lighter_spread_bps),
     var_fee_bps: "0",
-    fetch_lighter_last: "1",
-    fetch_lighter_last_limit: String(fundingFetchLimit),
-    fetch_lighter_last_workers: "8",
-    snapshot_max_age_s: "8",
+    detail_level: "fast",
+    snapshot_max_age_s: "5",
     force: force ? "1" : "0",
   });
 
-  const qs2 = new URLSearchParams({
+  const fundingFullQs = new URLSearchParams({
     notional: String(p.notional),
     top: String(p.top),
     lighter_spread_bps: String(p.lighter_spread_bps),
     var_fee_bps: "0",
+    detail_level: "full",
+    fetch_lighter_last: "1",
+    fetch_lighter_last_limit: String(fundingFetchLimit),
+    fetch_lighter_last_workers: "8",
+    snapshot_max_age_s: "15",
+    force: "0",
+  });
+
+  const priceFastQs = new URLSearchParams({
+    notional: String(p.notional),
+    top: String(p.top),
+    lighter_spread_bps: String(p.lighter_spread_bps),
+    var_fee_bps: "0",
+    detail_level: "fast",
+    max_markets: String(priceMaxMarkets),
+    concurrency: "16",
+    timeout_s: "25",
+    orderbook_cache_s: "1",
+    snapshot_max_age_s: "5",
+    force: force ? "1" : "0",
+  });
+
+  const priceFullQs = new URLSearchParams({
+    notional: String(p.notional),
+    top: String(p.top),
+    lighter_spread_bps: String(p.lighter_spread_bps),
+    var_fee_bps: "0",
+    detail_level: "full",
     max_markets: String(priceMaxMarkets),
     concurrency: "16",
     timeout_s: "25",
     orderbook_cache_s: "30",
-    snapshot_max_age_s: "8",
-    force: force ? "1" : "0",
+    snapshot_max_age_s: "15",
+    force: "0",
   });
 
   try {
-    const funding = await fetchJSON(`/api/funding?${qs.toString()}`);
-    const price = await fetchJSON(`/api/price?${qs2.toString()}`);
-    renderFunding(funding);
-    renderPrice(price);
+    const [fundingFast, priceFast] = await Promise.all([
+      fetchJSON(`/api/funding?${fundingFastQs.toString()}`),
+      fetchJSON(`/api/price?${priceFastQs.toString()}`),
+    ]);
+    if (reqSeq !== tableReqSeq) return;
+    renderFunding(fundingFast, null);
+    renderPrice(priceFast, null);
     refreshHistSymbolOptions({ force: false });
     updatedAt.textContent = nowCN();
+
+    Promise.allSettled([
+      fetchJSON(`/api/funding?${fundingFullQs.toString()}`),
+      fetchJSON(`/api/price?${priceFullQs.toString()}`),
+    ]).then((results) => {
+      if (reqSeq !== tableReqSeq) return;
+      const fundingFull = results[0].status === "fulfilled" ? results[0].value : null;
+      const priceFull = results[1].status === "fulfilled" ? results[1].value : null;
+      renderFunding(mergeItemsBySymbol(fundingFast, fundingFull), fundingFull);
+      renderPrice(mergeItemsBySymbol(priceFast, priceFull), priceFull);
+    });
   } catch (e) {
     updatedAt.textContent = "失败";
+    $("fundingFastMeta").textContent = "主: 失败";
+    $("fundingDetailMeta").textContent = "明细: 失败";
+    $("priceFastMeta").textContent = "主: 失败";
+    $("priceDetailMeta").textContent = "明细: 失败";
     $("fundingNote").textContent = `加载失败：${String(e.message || e)}`;
     $("priceNote").textContent = `加载失败：${String(e.message || e)}`;
   }
@@ -313,10 +428,10 @@ function init() {
 
   loadAll({ force: true });
 
-  // 3秒自动刷新，和服务端快照刷新节奏对齐。
+  // 1秒自动刷新，优先盯住主排名变化。
   window.setInterval(() => {
     loadAll({ force: false });
-  }, 3 * 1000);
+  }, 1 * 1000);
 
   initHistory();
 }

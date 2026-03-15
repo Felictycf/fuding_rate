@@ -13,9 +13,12 @@ Then open:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import io
+import math
 import os
+import ssl
 import time
 import threading
 import sqlite3
@@ -28,6 +31,11 @@ from urllib.parse import parse_qs, urlparse
 import arb_rank
 from http_json import get_json
 import price_arb_cn
+
+try:
+    import websockets
+except ImportError:  # pragma: no cover - optional runtime dependency
+    websockets = None
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +52,7 @@ LIGHTER_ORDERBOOK_DETAILS_URL = (
 LIGHTER_ORDERBOOK_ORDERS_URL = (
     "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders?market_id={market_id}&limit={limit}"
 )
+LIGHTER_STREAM_URL = "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"
 
 
 def _qget(q: dict, name: str, default: str) -> str:
@@ -197,11 +206,19 @@ COLLECTOR_INTERVAL_S = max(5.0, float(os.environ.get("COLLECTOR_INTERVAL_S", "10
 COLLECTOR_BATCH_SIZE = max(1, int(os.environ.get("COLLECTOR_BATCH_SIZE", "12")))
 COLLECTOR_SYMBOL_REFRESH_S = max(30.0, float(os.environ.get("COLLECTOR_SYMBOL_REFRESH_S", "300")))
 COLLECTOR_WORKERS = max(1, int(os.environ.get("COLLECTOR_WORKERS", "8")))
-SNAPSHOT_REFRESH_INTERVAL_S = max(2.0, float(os.environ.get("SNAPSHOT_REFRESH_INTERVAL_S", "3")))
+FAST_SNAPSHOT_REFRESH_INTERVAL_S = max(0.5, float(os.environ.get("FAST_SNAPSHOT_REFRESH_INTERVAL_S", "1")))
+FULL_SNAPSHOT_REFRESH_INTERVAL_S = max(2.0, float(os.environ.get("FULL_SNAPSHOT_REFRESH_INTERVAL_S", "6")))
 SNAPSHOT_ACTIVE_TTL_S = max(60.0, float(os.environ.get("SNAPSHOT_ACTIVE_TTL_S", "900")))
-SNAPSHOT_DEFAULT_MAX_AGE_S = max(
-    SNAPSHOT_REFRESH_INTERVAL_S * 2.5, float(os.environ.get("SNAPSHOT_DEFAULT_MAX_AGE_S", "8"))
+FAST_SNAPSHOT_DEFAULT_MAX_AGE_S = max(
+    FAST_SNAPSHOT_REFRESH_INTERVAL_S * 2.5,
+    float(os.environ.get("FAST_SNAPSHOT_DEFAULT_MAX_AGE_S", "5")),
 )
+FULL_SNAPSHOT_DEFAULT_MAX_AGE_S = max(
+    FULL_SNAPSHOT_REFRESH_INTERVAL_S * 2.5,
+    float(os.environ.get("FULL_SNAPSHOT_DEFAULT_MAX_AGE_S", "15")),
+)
+LIGHTER_WS_MARKET_REFRESH_S = max(30.0, float(os.environ.get("LIGHTER_WS_MARKET_REFRESH_S", "60")))
+LIGHTER_WS_STALE_AFTER_S = max(1.0, float(os.environ.get("LIGHTER_WS_STALE_AFTER_S", "10")))
 
 HISTORY_RANGE_MIN_S = 60
 HISTORY_RANGE_MAX_S = 7 * 24 * 3600
@@ -219,39 +236,262 @@ SNAPSHOTS: dict[str, dict[str, dict]] = {"funding": {}, "price": {}}
 SNAPSHOT_LOCK = threading.Lock()
 
 
+class LighterOrderBookState:
+    def __init__(self) -> None:
+        self._asks: dict[float, float] = {}
+        self._bids: dict[float, float] = {}
+        self.updated_at = 0.0
+
+    def apply_levels(
+        self, *, asks: list[dict] | None = None, bids: list[dict] | None = None, updated_at: float | None = None
+    ) -> None:
+        for book_side, levels in ((self._asks, asks or []), (self._bids, bids or [])):
+            for it in levels:
+                price = price_arb_cn.to_float((it or {}).get("price"))
+                size = price_arb_cn.to_float((it or {}).get("size"))
+                if price is None or price <= 0:
+                    continue
+                if size is None or size <= 0:
+                    book_side.pop(price, None)
+                    continue
+                book_side[price] = size
+        if updated_at is not None and updated_at > 0:
+            self.updated_at = updated_at
+
+    def snapshot(self, *, now: float | None = None) -> dict[str, float | None]:
+        best_ask = min(self._asks) if self._asks else None
+        best_bid = max(self._bids) if self._bids else None
+        mid = None
+        if best_bid is not None and best_ask is not None and best_ask >= best_bid:
+            mid = 0.5 * (best_bid + best_ask)
+        ts_now = time.time() if now is None else now
+        age_ms = int(max(0.0, ts_now - self.updated_at) * 1000) if self.updated_at > 0 else None
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "updated_at": self.updated_at or None,
+            "age_ms": age_ms,
+        }
+
+
+class LighterOrderBookStream:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._started = False
+        self._states: dict[int, LighterOrderBookState] = {}
+        self._symbol_to_market: dict[str, int] = {}
+        self._market_to_symbol: dict[int, str] = {}
+        self._subscribed_markets: set[int] = set()
+        self._connected = False
+        self._last_error: str | None = None
+        self._last_message_at = 0.0
+        self._last_market_refresh_at = 0.0
+
+    def ensure_started(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            self._thread = threading.Thread(target=self._run, name="lighter-orderbook-ws", daemon=True)
+            self._thread.start()
+
+    def snapshot_quotes(self, symbols: list[str]) -> tuple[dict[str, dict[str, float | str | int | bool | None]], dict]:
+        now = time.time()
+        out: dict[str, dict[str, float | str | int | bool | None]] = {}
+        max_age_ms: int | None = None
+        with self._lock:
+            for raw_sym in symbols:
+                sym = str(raw_sym or "").upper()
+                market_id = self._symbol_to_market.get(sym)
+                if not market_id:
+                    continue
+                state = self._states.get(market_id)
+                if not state:
+                    continue
+                snap = state.snapshot(now=now)
+                if snap["mid"] is None:
+                    continue
+                age_ms = snap["age_ms"]
+                if age_ms is not None and age_ms > int(LIGHTER_WS_STALE_AFTER_S * 1000):
+                    continue
+                if age_ms is not None:
+                    max_age_ms = age_ms if max_age_ms is None else max(max_age_ms, age_ms)
+                out[sym] = {
+                    "best_bid": snap["best_bid"],
+                    "best_ask": snap["best_ask"],
+                    "mid": snap["mid"],
+                    "age_ms": age_ms,
+                    "source": "ws_orderbook",
+                    "market_id": market_id,
+                }
+            meta = {
+                "connected": self._connected,
+                "subscribed": len(self._subscribed_markets),
+                "covered": len(out),
+                "age_ms": max_age_ms,
+                "last_error": self._last_error,
+                "last_message_age_ms": int(max(0.0, now - self._last_message_at) * 1000)
+                if self._last_message_at > 0
+                else None,
+            }
+        return out, meta
+
+    def _run(self) -> None:
+        asyncio.run(self._run_async())
+
+    async def _run_async(self) -> None:
+        while True:
+            try:
+                await self._refresh_market_targets(force=True)
+                await self._connect_and_consume()
+            except Exception as exc:  # pragma: no cover - network runtime behavior
+                with self._lock:
+                    self._connected = False
+                    self._last_error = str(exc)
+                await asyncio.sleep(1.0)
+
+    async def _connect_and_consume(self) -> None:
+        if websockets is None:  # pragma: no cover - dependency guard
+            raise RuntimeError("websockets package is unavailable")
+        try:
+            await self._connect_and_consume_with_ssl(ssl.create_default_context())
+        except ssl.SSLCertVerificationError:
+            insecure = ssl.create_default_context()
+            insecure.check_hostname = False
+            insecure.verify_mode = ssl.CERT_NONE
+            print("warning: SSL verification failed for Lighter WS; retrying without certificate verification")
+            await self._connect_and_consume_with_ssl(insecure)
+
+    async def _connect_and_consume_with_ssl(self, ssl_context: ssl.SSLContext) -> None:
+        async with websockets.connect(
+            LIGHTER_STREAM_URL,
+            ssl=ssl_context,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            max_queue=2048,
+        ) as ws:
+            with self._lock:
+                self._connected = False
+                self._subscribed_markets.clear()
+            await self._subscribe_all(ws)
+            with self._lock:
+                self._connected = True
+                self._last_error = None
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                self._handle_ws_message(raw)
+                await self._refresh_market_targets()
+                await self._subscribe_all(ws)
+
+    async def _refresh_market_targets(self, *, force: bool = False) -> None:
+        now = time.time()
+        with self._lock:
+            if not force and (now - self._last_market_refresh_at) < LIGHTER_WS_MARKET_REFRESH_S:
+                return
+        lighter_map = _get_lighter_market_map(timeout_s=10.0)
+        var_symbols = _get_var_symbols(timeout_s=10.0)
+        common_symbols = intersect_collector_symbols(var_symbols, lighter_map)
+        symbol_to_market = {sym: int(lighter_map[sym]) for sym in common_symbols if int(lighter_map.get(sym) or 0) > 0}
+        with self._lock:
+            self._symbol_to_market = symbol_to_market
+            self._market_to_symbol = {market_id: sym for sym, market_id in symbol_to_market.items()}
+            self._last_market_refresh_at = now
+
+    async def _subscribe_all(self, ws) -> None:
+        with self._lock:
+            targets = [
+                (sym, market_id)
+                for sym, market_id in self._symbol_to_market.items()
+                if market_id not in self._subscribed_markets
+            ]
+        for _sym, market_id in targets:
+            await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{market_id}"}))
+            with self._lock:
+                self._subscribed_markets.add(market_id)
+
+    def _handle_ws_message(self, raw: str) -> None:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        book = payload.get("order_book") or {}
+        if not isinstance(book, dict):
+            return
+        channel = str(payload.get("channel") or "")
+        if not channel.startswith("order_book:"):
+            return
+        try:
+            market_id = int(channel.split(":", 1)[1])
+        except Exception:
+            return
+        updated_at = price_arb_cn.to_float(payload.get("timestamp"))
+        if updated_at:
+            updated_at = updated_at / 1000.0
+        else:
+            updated_at = time.time()
+        with self._lock:
+            state = self._states.setdefault(market_id, LighterOrderBookState())
+            state.apply_levels(
+                asks=book.get("asks") if isinstance(book.get("asks"), list) else [],
+                bids=book.get("bids") if isinstance(book.get("bids"), list) else [],
+                updated_at=updated_at,
+            )
+            self._last_message_at = updated_at
+
+
+LIGHTER_ORDERBOOK_STREAM = LighterOrderBookStream()
+
+
 def _http_get_json(url: str, timeout_s: float) -> dict:
     return get_json(url, timeout_s=timeout_s, user_agent="arb-dashboard/1.0")
 
 
-def default_funding_snapshot_params() -> dict[str, object]:
+def default_snapshot_max_age(detail_level: str) -> float:
+    return FAST_SNAPSHOT_DEFAULT_MAX_AGE_S if detail_level == "fast" else FULL_SNAPSHOT_DEFAULT_MAX_AGE_S
+
+
+def default_funding_snapshot_params(detail_level: str = "fast") -> dict[str, object]:
+    fast = detail_level == "fast"
     return {
+        "detail_level": detail_level,
         "notional": 1000.0,
         "top": 30,
         "lighter_spread_bps": 5.0,
         "var_fee_bps": 0.0,
-        "fetch_last": True,
-        "fetch_limit": 8,
+        "fetch_last": not fast,
+        "fetch_limit": 0 if fast else 8,
         "funding_sign": "longs_pay",
         "timeout_s": 25.0,
+        "refresh_interval_s": FAST_SNAPSHOT_REFRESH_INTERVAL_S if fast else FULL_SNAPSHOT_REFRESH_INTERVAL_S,
     }
 
 
-def default_price_snapshot_params() -> dict[str, object]:
+def default_price_snapshot_params(detail_level: str = "fast") -> dict[str, object]:
+    fast = detail_level == "fast"
     return {
+        "detail_level": detail_level,
         "notional": 1000.0,
         "top": 30,
         "lighter_spread_bps": 5.0,
         "var_fee_bps": 0.0,
         "max_markets": 40,
         "concurrency": 16,
-        "cache_seconds": 30.0,
+        "cache_seconds": 1.0 if fast else 30.0,
         "timeout_s": 25.0,
+        "fast_mode": fast,
+        "refresh_interval_s": FAST_SNAPSHOT_REFRESH_INTERVAL_S if fast else FULL_SNAPSHOT_REFRESH_INTERVAL_S,
     }
 
 
 def funding_snapshot_key(params: dict[str, object]) -> str:
     return (
         "funding"
+        f"|detail={params['detail_level']}"
         f"|n={params['notional']}"
         f"|top={params['top']}"
         f"|ls={params['lighter_spread_bps']}"
@@ -265,6 +505,7 @@ def funding_snapshot_key(params: dict[str, object]) -> str:
 def price_snapshot_key(params: dict[str, object]) -> str:
     return (
         "price"
+        f"|detail={params['detail_level']}"
         f"|n={params['notional']}"
         f"|top={params['top']}"
         f"|ls={params['lighter_spread_bps']}"
@@ -276,36 +517,42 @@ def price_snapshot_key(params: dict[str, object]) -> str:
 
 
 def seed_snapshot_targets() -> None:
-    funding_params = default_funding_snapshot_params()
-    price_params = default_price_snapshot_params()
     now = time.time()
     with SNAPSHOT_LOCK:
-        SNAPSHOTS.setdefault("funding", {}).setdefault(
-            funding_snapshot_key(funding_params),
-            {
-                "params": funding_params,
-                "data": None,
-                "updated_at": 0.0,
-                "last_access": now,
-                "last_error": None,
-            },
-        )
-        SNAPSHOTS.setdefault("price", {}).setdefault(
-            price_snapshot_key(price_params),
-            {
-                "params": price_params,
-                "data": None,
-                "updated_at": 0.0,
-                "last_access": now,
-                "last_error": None,
-            },
-        )
+        for detail_level in ("fast", "full"):
+            funding_params = default_funding_snapshot_params(detail_level)
+            SNAPSHOTS.setdefault("funding", {}).setdefault(
+                funding_snapshot_key(funding_params),
+                {
+                    "params": funding_params,
+                    "data": None,
+                    "updated_at": 0.0,
+                    "last_access": now,
+                    "last_error": None,
+                    "refresh_interval_s": funding_params["refresh_interval_s"],
+                },
+            )
+            price_params = default_price_snapshot_params(detail_level)
+            SNAPSHOTS.setdefault("price", {}).setdefault(
+                price_snapshot_key(price_params),
+                {
+                    "params": price_params,
+                    "data": None,
+                    "updated_at": 0.0,
+                    "last_access": now,
+                    "last_error": None,
+                    "refresh_interval_s": price_params["refresh_interval_s"],
+                },
+            )
 
 
-def _snapshot_payload(data: dict, source: str, updated_at: float, last_error: str | None) -> dict:
+def _snapshot_payload(
+    data: dict, source: str, updated_at: float, last_error: str | None, detail_level: str
+) -> dict:
     payload = dict(data)
     age_ms = max(0, int((time.time() - updated_at) * 1000)) if updated_at > 0 else None
     payload["source"] = source
+    payload["detail_level"] = detail_level
     payload["snapshot_asof_unix"] = int(updated_at) if updated_at > 0 else None
     payload["snapshot_age_ms"] = age_ms
     if last_error:
@@ -349,7 +596,13 @@ def resolve_snapshot_payload(
             and stale_updated_at > 0
             and (now - stale_updated_at) <= max(0.0, float(snapshot_max_age_s))
         ):
-            return _snapshot_payload(stale_data, "snapshot", stale_updated_at, stale_error)
+            return _snapshot_payload(
+                stale_data,
+                "snapshot",
+                stale_updated_at,
+                stale_error,
+                str(params.get("detail_level") or "fast"),
+            )
 
     try:
         data = live_fetcher()
@@ -371,7 +624,13 @@ def resolve_snapshot_payload(
             stale_updated_at = float(entry.get("updated_at") or 0.0)
             stale_error = entry.get("last_error")
         if stale_data is not None and not force:
-            payload = _snapshot_payload(stale_data, "snapshot", stale_updated_at, stale_error)
+            payload = _snapshot_payload(
+                stale_data,
+                "snapshot",
+                stale_updated_at,
+                stale_error,
+                str(params.get("detail_level") or "fast"),
+            )
             payload["snapshot_stale"] = True
             return payload
         raise
@@ -393,7 +652,8 @@ def resolve_snapshot_payload(
         entry["updated_at"] = updated_at
         entry["last_access"] = updated_at
         entry["last_error"] = None
-    return _snapshot_payload(data, "live", updated_at, None)
+        entry["refresh_interval_s"] = float(params.get("refresh_interval_s") or entry.get("refresh_interval_s") or 0)
+    return _snapshot_payload(data, "live", updated_at, None, str(params.get("detail_level") or "fast"))
 
 
 def normalize_history_query(range_s: int, limit: int) -> tuple[int, int]:
@@ -558,6 +818,11 @@ def _get_lighter_market_map(timeout_s: float = 10.0) -> dict:
     return m
 
 
+def _get_lighter_ws_quotes_for_symbols(symbols: list[str]) -> tuple[dict[str, dict], dict]:
+    LIGHTER_ORDERBOOK_STREAM.ensure_started()
+    return LIGHTER_ORDERBOOK_STREAM.snapshot_quotes(symbols)
+
+
 def _extract_best_bid_ask(orders_j: dict) -> tuple[float | None, float | None]:
     if int(orders_j.get("code") or 0) != 200:
         return (None, None)
@@ -585,6 +850,14 @@ def _extract_best_bid_ask(orders_j: dict) -> tuple[float | None, float | None]:
 def _get_lighter_quote(
     symbol: str, timeout_s: float = 10.0
 ) -> tuple[float | None, float | None, float | None]:
+    ws_quotes, _ws_meta = _get_lighter_ws_quotes_for_symbols([symbol])
+    ws_quote = ws_quotes.get(symbol.upper())
+    if ws_quote and ws_quote.get("mid") is not None:
+        return (
+            price_arb_cn.to_float(ws_quote.get("best_bid")),
+            price_arb_cn.to_float(ws_quote.get("best_ask")),
+            price_arb_cn.to_float(ws_quote.get("mid")),
+        )
     m = _get_lighter_market_map(timeout_s=timeout_s)
     mid = m.get(symbol.upper())
     if not mid:
@@ -616,7 +889,100 @@ def _get_lighter_last(symbol: str, timeout_s: float = 10.0) -> float | None:
     return last
 
 
+def build_funding_payload_fast(params: dict[str, object]) -> dict:
+    t0 = time.time()
+    pos_means_longs_pay = str(params["funding_sign"]) == "longs_pay"
+    var_j = arb_rank.http_get_json(arb_rank.VARIATIONAL_STATS_URL, timeout_s=float(params["timeout_s"]))
+    lighter_funding_j = arb_rank.http_get_json(arb_rank.LIGHTER_FUNDING_URL, timeout_s=float(params["timeout_s"]))
+    lighter_meta_j = arb_rank.http_get_json(arb_rank.LIGHTER_ORDERBOOKS_URL, timeout_s=float(params["timeout_s"]))
+
+    aliases = arb_rank.parse_symbol_aliases(str(params.get("symbol_aliases_json") or ""))
+    var = arb_rank.parse_variational_markets(
+        var_j,
+        notional_bucket="size_1k",
+        rate_is_percent=True,
+        pos_means_longs_pay=pos_means_longs_pay,
+        default_fee_bps=float(params["var_fee_bps"]),
+    )
+    lighter_rates = arb_rank.parse_lighter_funding(
+        lighter_funding_j,
+        rate_is_percent=False,
+        interval_s=28800,
+        pos_means_longs_pay=pos_means_longs_pay,
+    )
+    lighter_meta = arb_rank.parse_lighter_orderbooks_meta(lighter_meta_j)
+    if aliases:
+        var = {arb_rank.canonical_symbol(k, aliases): v for k, v in var.items()}
+        lighter_rates = {arb_rank.canonical_symbol(k, aliases): v for k, v in lighter_rates.items()}
+        lighter_meta = {arb_rank.canonical_symbol(k, aliases): v for k, v in lighter_meta.items()}
+    symbol_whitelist = arb_rank.build_symbol_whitelist(var.keys(), lighter_rates.keys(), aliases=aliases)
+    rows = arb_rank.build_rows(
+        var=var,
+        lighter_rates=lighter_rates,
+        lighter_meta=lighter_meta,
+        lighter_spread_bps_assumed=float(params["lighter_spread_bps"]),
+        symbol_whitelist=symbol_whitelist,
+    )
+
+    ranked: list[tuple[float, arb_rank.MarketRow, str, float, float, float]] = []
+    notional = float(params["notional"])
+    for r in rows:
+        strat, funding_1d, _funding_interval = r.best_funding_trade(notional)
+        cost = r.round_trip_cost_usd(notional)
+        net_1d = funding_1d - cost
+        breakeven_days = (cost / funding_1d) if funding_1d > 0 else float("inf")
+        ranked.append((net_1d, r, strat, funding_1d, cost, breakeven_days))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    payload = {
+        "asof_unix": int(time.time()),
+        "notional_usd": notional,
+        "detail_level": "fast",
+        "assumptions": {
+            "funding_sign": str(params["funding_sign"]),
+            "var_fee_bps_per_trade": float(params["var_fee_bps"]),
+            "lighter_spread_bps_assumed_round_trip_excl_fees": float(params["lighter_spread_bps"]),
+            "symbol_whitelist_size": len(symbol_whitelist),
+        },
+        "items": [],
+        "fetch_ms": int((time.time() - t0) * 1000),
+    }
+    ranked_show = ranked[: max(int(params["top"]), 0)] if int(params["top"]) else ranked
+    for net_1d, r, strat, funding_1d, cost, breakeven_days in ranked_show:
+        payload["items"].append(
+            {
+                "symbol": r.symbol,
+                "strategy": strat,
+                "funding_pnl_1d_usd": funding_1d,
+                "round_trip_cost_usd": cost,
+                "net_1d_usd": net_1d,
+                "breakeven_days": None if not math.isfinite(breakeven_days) else breakeven_days,
+                "basis_bps_indicative": None,
+                "prices": {
+                    "var_mid": r.var_mid,
+                    "lighter_last_trade": None,
+                    "lighter_best_bid": None,
+                    "lighter_best_ask": None,
+                    "lighter_price_source": "pending_detail",
+                },
+                "var": {
+                    "rate_frac_per_interval": r.var_rate.rate_frac_per_interval,
+                    "interval_s": r.var_rate.interval_s,
+                    "round_trip_bps": r.var_round_trip_bps,
+                },
+                "lighter": {
+                    "rate_frac_per_interval": r.lighter_rate.rate_frac_per_interval,
+                    "interval_s": r.lighter_rate.interval_s,
+                    "round_trip_bps": r.lighter_round_trip_bps,
+                },
+            }
+        )
+    return payload
+
+
 def build_funding_payload(params: dict[str, object]) -> dict:
+    if str(params.get("detail_level") or "fast") == "fast":
+        return build_funding_payload_fast(params)
     argv = [
         "--json",
         "--notional",
@@ -634,6 +1000,7 @@ def build_funding_payload(params: dict[str, object]) -> dict:
         argv += ["--fetch-lighter-last", "--fetch-lighter-last-limit", str(params["fetch_limit"])]
 
     data = _run_module_json(arb_rank.main, argv, timeout_s=float(params["timeout_s"]))
+    data["detail_level"] = str(params.get("detail_level") or "fast")
     ts = int(time.time())
     rows = []
     for it in data.get("items", []) or []:
@@ -666,7 +1033,166 @@ def build_funding_payload(params: dict[str, object]) -> dict:
     return data
 
 
+def build_price_payload_fast(params: dict[str, object]) -> dict:
+    t0 = time.time()
+    aliases = price_arb_cn.parse_symbol_aliases(str(params.get("symbol_aliases_json") or ""))
+    timeout_s = float(params["timeout_s"])
+    var_j = price_arb_cn.http_get_json(price_arb_cn.VARIATIONAL_STATS_URL, timeout_s=timeout_s)
+    lighter_meta_j = price_arb_cn.http_get_json(price_arb_cn.LIGHTER_ORDERBOOKS_URL, timeout_s=timeout_s)
+
+    var_map: dict[str, tuple[float | None, float | None, float | None, float | None]] = {}
+    for it in (var_j.get("listings") or []):
+        sym = price_arb_cn.canonical_symbol(it.get("ticker"), aliases)
+        if not sym:
+            continue
+        quotes = it.get("quotes") or {}
+        q = quotes.get("size_1k") or quotes.get("base") or {}
+        bid = price_arb_cn.to_float(q.get("bid")) if isinstance(q, dict) else None
+        ask = price_arb_cn.to_float(q.get("ask")) if isinstance(q, dict) else None
+        if bid and ask and ask >= bid:
+            mid = 0.5 * (bid + ask)
+        else:
+            mp = price_arb_cn.to_float(it.get("mark_price"))
+            mid = mp if mp and mp > 0 else None
+        spread = price_arb_cn.bps_from_bid_ask(bid, ask) if bid and ask else None
+        var_map[sym] = (bid, ask, mid, spread)
+
+    if int(lighter_meta_j.get("code") or 0) != 200:
+        raise RuntimeError(f"Lighter orderBooks 返回 code={lighter_meta_j.get('code')}")
+
+    lighter_markets: list[tuple[str, int, float]] = []
+    for it in (lighter_meta_j.get("order_books") or []):
+        if not price_arb_cn.is_valid_lighter_market_spec(it):
+            continue
+        sym = price_arb_cn.canonical_symbol(it.get("symbol"), aliases)
+        mid = int(it.get("market_id") or 0)
+        if not sym or mid <= 0:
+            continue
+        taker_fee_frac = price_arb_cn.to_float(it.get("taker_fee")) or 0.0
+        lighter_markets.append((sym, mid, float(taker_fee_frac * 1e4)))
+
+    symbol_whitelist = price_arb_cn.build_symbol_whitelist(list(var_map.keys()), [m[0] for m in lighter_markets], aliases)
+    lighter_markets = [m for m in lighter_markets if m[0] in symbol_whitelist]
+    lighter_markets = lighter_markets[: max(0, int(params["max_markets"]))]
+
+    ws_quotes, ws_meta = _get_lighter_ws_quotes_for_symbols([sym for sym, _mid, _fee in lighter_markets])
+
+    def fetch_one(sym: str, market_id: int) -> tuple[str, float | None, float | None, float | None, str]:
+        durl = price_arb_cn.LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=market_id)
+        details_j = price_arb_cn.http_get_json(durl, timeout_s=timeout_s)
+        px = price_arb_cn.extract_last_trade_price(details_j)
+        src = "last_trade_fast" if px is not None else "none"
+        return (sym, px, None, None, src)
+
+    ref_map: dict[str, tuple[float | None, float | None, float | None, str]] = {}
+    missing_markets: list[tuple[str, int, float]] = []
+    for sym, market_id, taker_fee_bps in lighter_markets:
+        ws_quote = ws_quotes.get(sym)
+        ws_mid = price_arb_cn.to_float((ws_quote or {}).get("mid"))
+        if ws_mid is None:
+            missing_markets.append((sym, market_id, taker_fee_bps))
+            continue
+        ref_map[sym] = (
+            ws_mid,
+            price_arb_cn.to_float(ws_quote.get("best_bid")),
+            price_arb_cn.to_float(ws_quote.get("best_ask")),
+            str(ws_quote.get("source") or "ws_orderbook"),
+        )
+
+    if missing_markets:
+        with ThreadPoolExecutor(max_workers=max(1, int(params["concurrency"]))) as ex:
+            futs = [ex.submit(fetch_one, sym, mid) for (sym, mid, _fee) in missing_markets]
+            for fu in futs:
+                sym, ref_px, ref_bid, ref_ask, ref_src = fu.result()
+                ref_map[sym] = (ref_px, ref_bid, ref_ask, ref_src)
+
+    rows: list[price_arb_cn.Row] = []
+    for sym, _mid, taker_fee_bps in lighter_markets:
+        bid, ask, var_mid, var_spread_bps = var_map.get(sym, (None, None, None, None))
+        lighter_ref, lighter_bid, lighter_ask, lighter_src = ref_map.get(sym, (None, None, None, "none"))
+        if var_mid is None or lighter_ref is None:
+            continue
+        if not price_arb_cn.is_reasonable_price_ratio(var_mid, lighter_ref, 0.2, 5.0):
+            continue
+        diff = price_arb_cn.bps_diff(var_mid, lighter_ref)
+        if diff is None:
+            continue
+        direction = "卖VAR/买Lighter(参考)" if diff > 0 else "买VAR/卖Lighter(参考)"
+        var_open_bps = float(var_spread_bps or 0.0) + float(params["var_fee_bps"])
+        lighter_open_bps = float(params["lighter_spread_bps"]) + float(taker_fee_bps)
+        open_cost_bps = var_open_bps + lighter_open_bps
+        round_trip_bps = 2.0 * open_cost_bps
+        rows.append(
+            price_arb_cn.Row(
+                标的=sym,
+                方向=direction,
+                VAR_bid=bid,
+                VAR_ask=ask,
+                VAR_mid=var_mid,
+                Lighter_last=lighter_ref,
+                Lighter_bid=lighter_bid,
+                Lighter_ask=lighter_ask,
+                Lighter_price_source=lighter_src,
+                参考差价_bps=diff,
+                VAR点差_bps=var_spread_bps,
+                Lighter真实点差_bps=price_arb_cn.bps_from_bid_ask(lighter_bid, lighter_ask)
+                if lighter_bid and lighter_ask
+                else None,
+                Lighter假设点差_bps=float(params["lighter_spread_bps"]),
+                Lighter_taker_fee_bps=float(taker_fee_bps),
+                开仓成本_bps=open_cost_bps,
+                往返成本_bps=round_trip_bps,
+                名义本金=float(params["notional"]),
+            )
+        )
+
+    rows.sort(key=lambda r: r.参考净利润_u_往返() if r.参考净利润_u_往返() is not None else -1e18, reverse=True)
+    payload = {
+        "asof_unix": int(time.time()),
+        "fetch_ms": int((time.time() - t0) * 1000),
+        "notional_usd": float(params["notional"]),
+        "detail_level": "fast",
+        "lighter_ws_connected": bool(ws_meta.get("connected")),
+        "lighter_ws_subscribed": int(ws_meta.get("subscribed") or 0),
+        "lighter_ws_covered": int(len(ws_quotes)),
+        "lighter_ws_age_ms": ws_meta.get("age_ms"),
+        "lighter_ws_fallback_count": len(missing_markets),
+        "items": [],
+    }
+    show = rows[: max(0, int(params["top"]))]
+    for r in show:
+        payload["items"].append(
+            {
+                "symbol": r.标的,
+                "direction_hint": r.方向,
+                "diff_bps": r.参考差价_bps,
+                "gross_u": r.理论毛利润_u(),
+                "round_trip_bps": r.往返成本_bps,
+                "net_u_round_trip": r.参考净利润_u_往返(),
+                "var": {
+                    "bid": r.VAR_bid,
+                    "ask": r.VAR_ask,
+                    "mid": r.VAR_mid,
+                    "spread_bps": r.VAR点差_bps,
+                    "fee_bps_per_trade": float(params["var_fee_bps"]),
+                },
+                "lighter": {
+                    "last_trade": r.Lighter_last,
+                    "best_bid": r.Lighter_bid,
+                    "best_ask": r.Lighter_ask,
+                    "price_source": r.Lighter_price_source,
+                    "spread_bps_used": r.Lighter真实点差_bps,
+                    "taker_fee_bps": r.Lighter_taker_fee_bps,
+                    "assumed_spread_bps_per_trade": r.Lighter假设点差_bps,
+                },
+            }
+        )
+    return payload
+
+
 def build_price_payload(params: dict[str, object]) -> dict:
+    if str(params.get("detail_level") or "fast") == "fast":
+        return build_price_payload_fast(params)
     argv = [
         "--json",
         "--名义本金",
@@ -684,7 +1210,10 @@ def build_price_payload(params: dict[str, object]) -> dict:
         "--缓存秒",
         str(params["cache_seconds"]),
     ]
+    if params.get("fast_mode"):
+        argv.append("--fast-mode")
     data = _run_module_json(price_arb_cn.main, argv, timeout_s=float(params["timeout_s"]))
+    data["detail_level"] = str(params.get("detail_level") or "fast")
     ts = int(time.time())
     rows = []
     for it in data.get("items", []) or []:
@@ -717,14 +1246,20 @@ def build_price_payload(params: dict[str, object]) -> dict:
     return data
 
 
-def _snapshot_work_items(kind: str) -> list[tuple[str, dict[str, object]]]:
+def _snapshot_work_items(kind: str, detail_level: str) -> list[tuple[str, dict[str, object]]]:
     now = time.time()
     with SNAPSHOT_LOCK:
         bucket = SNAPSHOTS.get(kind, {})
         return [
             (key, dict(entry.get("params") or {}))
             for key, entry in bucket.items()
+            if str((entry.get("params") or {}).get("detail_level") or "fast") == detail_level
             if (now - float(entry.get("last_access") or 0.0)) <= SNAPSHOT_ACTIVE_TTL_S
+            and (
+                float(entry.get("updated_at") or 0.0) <= 0
+                or (now - float(entry.get("updated_at") or 0.0))
+                >= float(entry.get("refresh_interval_s") or FAST_SNAPSHOT_REFRESH_INTERVAL_S)
+            )
         ]
 
 
@@ -745,6 +1280,7 @@ def _refresh_snapshot(kind: str, key: str, params: dict[str, object]) -> None:
                 },
             )
             entry["last_error"] = str(exc)
+            entry["refresh_interval_s"] = float(params.get("refresh_interval_s") or entry.get("refresh_interval_s") or 0)
         return
     updated_at = time.time()
     with SNAPSHOT_LOCK:
@@ -762,17 +1298,34 @@ def _refresh_snapshot(kind: str, key: str, params: dict[str, object]) -> None:
         entry["data"] = data
         entry["updated_at"] = updated_at
         entry["last_error"] = None
+        entry["refresh_interval_s"] = float(params.get("refresh_interval_s") or entry.get("refresh_interval_s") or 0)
 
 
-def _snapshot_loop(kind: str) -> None:
+def _snapshot_loop(kind: str, detail_level: str) -> None:
     while True:
         seed_snapshot_targets()
-        for key, params in _snapshot_work_items(kind):
+        for key, params in _snapshot_work_items(kind, detail_level):
             try:
                 _refresh_snapshot(kind, key, params)
             except Exception:
                 continue
-        time.sleep(SNAPSHOT_REFRESH_INTERVAL_S)
+        time.sleep(0.25)
+
+
+def _warm_default_fast_snapshots() -> None:
+    seed_snapshot_targets()
+    items = [
+        ("funding", funding_snapshot_key(default_funding_snapshot_params("fast")), default_funding_snapshot_params("fast")),
+        ("price", price_snapshot_key(default_price_snapshot_params("fast")), default_price_snapshot_params("fast")),
+    ]
+    threads = [
+        threading.Thread(target=_refresh_snapshot, args=(kind, key, params), daemon=True)
+        for kind, key, params in items
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
 
 
 def _sampler_loop() -> None:
@@ -924,21 +1477,29 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         force = _qget_bool(q, "force", False)
         timeout_s = _qget_float(q, "timeout_s", 45.0)
-        snapshot_max_age_s = _qget_float(q, "snapshot_max_age_s", SNAPSHOT_DEFAULT_MAX_AGE_S)
 
         try:
             if u.path == "/api/funding":
                 top = _qget_int(q, "top", 30)
+                detail_level = _qget(q, "detail_level", "fast").strip().lower()
+                if detail_level not in ("fast", "full"):
+                    self._send_json(400, {"error": f"invalid detail_level: {detail_level}"})
+                    return
                 params = {
+                    "detail_level": detail_level,
                     "notional": _qget_float(q, "notional", 1000.0),
                     "top": top,
                     "lighter_spread_bps": _qget_float(q, "lighter_spread_bps", 5.0),
                     "var_fee_bps": _qget_float(q, "var_fee_bps", 0.0),
-                    "fetch_last": _qget_bool(q, "fetch_lighter_last", True),
-                    "fetch_limit": _qget_int(q, "fetch_lighter_last_limit", top),
+                    "fetch_last": _qget_bool(q, "fetch_lighter_last", detail_level == "full"),
+                    "fetch_limit": _qget_int(q, "fetch_lighter_last_limit", 8 if detail_level == "full" else 0),
                     "funding_sign": _qget(q, "funding_sign", "longs_pay"),
                     "timeout_s": timeout_s,
+                    "refresh_interval_s": FAST_SNAPSHOT_REFRESH_INTERVAL_S
+                    if detail_level == "fast"
+                    else FULL_SNAPSHOT_REFRESH_INTERVAL_S,
                 }
+                snapshot_max_age_s = _qget_float(q, "snapshot_max_age_s", default_snapshot_max_age(detail_level))
                 key = funding_snapshot_key(params)
                 data = resolve_snapshot_payload(
                     "funding",
@@ -952,16 +1513,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if u.path == "/api/price":
+                detail_level = _qget(q, "detail_level", "fast").strip().lower()
+                if detail_level not in ("fast", "full"):
+                    self._send_json(400, {"error": f"invalid detail_level: {detail_level}"})
+                    return
                 params = {
+                    "detail_level": detail_level,
                     "notional": _qget_float(q, "notional", 1000.0),
                     "top": _qget_int(q, "top", 30),
                     "lighter_spread_bps": _qget_float(q, "lighter_spread_bps", 5.0),
                     "var_fee_bps": _qget_float(q, "var_fee_bps", 0.0),
                     "max_markets": _qget_int(q, "max_markets", 120),
                     "concurrency": _qget_int(q, "concurrency", 16),
-                    "cache_seconds": _qget_float(q, "orderbook_cache_s", 30.0),
+                    "cache_seconds": _qget_float(q, "orderbook_cache_s", 1.0 if detail_level == "fast" else 30.0),
                     "timeout_s": timeout_s,
+                    "fast_mode": _qget_bool(q, "fast_mode", detail_level == "fast"),
+                    "refresh_interval_s": FAST_SNAPSHOT_REFRESH_INTERVAL_S
+                    if detail_level == "fast"
+                    else FULL_SNAPSHOT_REFRESH_INTERVAL_S,
                 }
+                snapshot_max_age_s = _qget_float(q, "snapshot_max_age_s", default_snapshot_max_age(detail_level))
                 key = price_snapshot_key(params)
                 data = resolve_snapshot_payload(
                     "price",
@@ -1199,10 +1770,20 @@ def main() -> int:
     if not os.path.isdir(WEB_DIR):
         raise SystemExit(f"Missing web dir: {WEB_DIR}")
     seed_snapshot_targets()
-    funding_snapshot = threading.Thread(target=_snapshot_loop, args=("funding",), name="funding-snapshot", daemon=True)
-    funding_snapshot.start()
-    price_snapshot = threading.Thread(target=_snapshot_loop, args=("price",), name="price-snapshot", daemon=True)
-    price_snapshot.start()
+    LIGHTER_ORDERBOOK_STREAM.ensure_started()
+    _warm_default_fast_snapshots()
+    for kind, detail_level in (
+        ("funding", "fast"),
+        ("funding", "full"),
+        ("price", "fast"),
+        ("price", "full"),
+    ):
+        threading.Thread(
+            target=_snapshot_loop,
+            args=(kind, detail_level),
+            name=f"{kind}-{detail_level}-snapshot",
+            daemon=True,
+        ).start()
     th = threading.Thread(target=_sampler_loop, name="basis-sampler", daemon=True)
     th.start()
     collector = threading.Thread(target=_collector_loop, name="history-collector", daemon=True)
@@ -1211,7 +1792,8 @@ def main() -> int:
     print(f"Dashboard: http://{host}:{port}")
     print("API: /api/funding , /api/price")
     print(
-        f"Snapshots: interval={SNAPSHOT_REFRESH_INTERVAL_S:.1f}s max_age_default={SNAPSHOT_DEFAULT_MAX_AGE_S:.1f}s"
+        f"Snapshots: fast={FAST_SNAPSHOT_REFRESH_INTERVAL_S:.1f}s/{FAST_SNAPSHOT_DEFAULT_MAX_AGE_S:.1f}s "
+        f"full={FULL_SNAPSHOT_REFRESH_INTERVAL_S:.1f}s/{FULL_SNAPSHOT_DEFAULT_MAX_AGE_S:.1f}s"
     )
     print(
         f"Collector: enabled interval={COLLECTOR_INTERVAL_S:.1f}s batch={COLLECTOR_BATCH_SIZE} workers={COLLECTOR_WORKERS}"

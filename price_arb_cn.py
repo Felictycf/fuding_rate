@@ -299,6 +299,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--min_price_ratio", type=float, default=0.2, help="价格比下限(VAR_mid/L_last)，默认0.2")
     ap.add_argument("--max_price_ratio", type=float, default=5.0, help="价格比上限(VAR_mid/L_last)，默认5.0")
     ap.add_argument("--显示前N", type=int, default=30, help="显示前 N 条，默认 30")
+    ap.add_argument("--fast-mode", action="store_true", help="极速模式：只用 last_trade_price，不拉 orderBookOrders")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出(便于网页展示)")
     args = ap.parse_args(argv)
 
@@ -359,11 +360,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         orders_j: Optional[Dict[str, Any]] = None
         if args.缓存秒 != 0:
             cd = read_cache(cp, max_age_s=float(args.缓存秒))
-            co = read_cache(op, max_age_s=float(args.缓存秒))
             if isinstance(cd, dict):
                 details_j = cd
-            if isinstance(co, dict):
-                orders_j = co
+            if not args.fast_mode:
+                co = read_cache(op, max_age_s=float(args.缓存秒))
+                if isinstance(co, dict):
+                    orders_j = co
         if details_j is None:
             durl = LIGHTER_ORDERBOOK_DETAILS_URL.format(market_id=market_id)
             details_j = http_get_json(durl, timeout_s=args.超时)
@@ -372,6 +374,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     write_cache(cp, details_j)
                 except Exception:
                     pass
+        if args.fast_mode:
+            px = extract_last_trade_price(details_j)
+            src = "last_trade_fast" if px is not None else "none"
+            return (sym, market_id, px, None, None, src)
         if orders_j is None:
             ourl = LIGHTER_ORDERBOOK_ORDERS_URL.format(market_id=market_id, limit=limit)
             orders_j = http_get_json(ourl, timeout_s=args.超时)
