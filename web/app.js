@@ -26,6 +26,30 @@ function fmtMaybe(x, digits = 2) {
   return fmtNum(x, digits);
 }
 
+function fmtAgeMs(ms) {
+  if (ms === null || ms === undefined || !Number.isFinite(Number(ms))) return "未知";
+  const n = Number(ms);
+  if (n < 1000) return `${Math.round(n)} ms`;
+  return `${(n / 1000).toFixed(1)} s`;
+}
+
+function renderLatencyNote(prefix, count, payload) {
+  const parts = [`展示 ${count} 条`];
+  const source = String(payload?.source || "");
+  if (source === "snapshot") {
+    parts.push(`来源：快照${payload?.snapshot_stale ? "（过期兜底）" : ""}`);
+  } else if (source === "live") {
+    parts.push("来源：实时");
+  }
+  if (payload?.snapshot_age_ms !== undefined && payload?.snapshot_age_ms !== null) {
+    parts.push(`快照年龄：${fmtAgeMs(payload.snapshot_age_ms)}`);
+  }
+  if (payload?.fetch_ms !== undefined && payload?.fetch_ms !== null) {
+    parts.push(`最近计算：${payload.fetch_ms} ms`);
+  }
+  prefix.textContent = `${parts.join("。")}。`;
+}
+
 function badgeForValue(v) {
   // v: net profit or net/day
   if (v === null || v === undefined) return "warn";
@@ -149,9 +173,7 @@ function renderFunding(j) {
   });
 
   const note = $("fundingNote");
-  const n = items.length;
-  const ms = j.fetch_ms ?? null;
-  note.textContent = `展示 ${n} 条。抓取耗时：${ms !== null ? `${ms} ms` : "未知"}。`;
+  renderLatencyNote(note, items.length, j);
 }
 
 function renderPrice(j) {
@@ -230,9 +252,7 @@ function renderPrice(j) {
   });
 
   const note = $("priceNote");
-  const n = items.length;
-  const ms = j.fetch_ms ?? null;
-  note.textContent = `展示 ${n} 条。抓取耗时：${ms !== null ? `${ms} ms` : "未知"}。`;
+  renderLatencyNote(note, items.length, j);
 }
 
 async function loadAll({ force = false } = {}) {
@@ -250,7 +270,7 @@ async function loadAll({ force = false } = {}) {
     fetch_lighter_last: "1",
     fetch_lighter_last_limit: String(fundingFetchLimit),
     fetch_lighter_last_workers: "8",
-    cache_s: "300",
+    snapshot_max_age_s: "8",
     force: force ? "1" : "0",
   });
 
@@ -263,7 +283,7 @@ async function loadAll({ force = false } = {}) {
     concurrency: "16",
     timeout_s: "25",
     orderbook_cache_s: "30",
-    cache_s: "300",
+    snapshot_max_age_s: "8",
     force: force ? "1" : "0",
   });
 
@@ -293,10 +313,10 @@ function init() {
 
   loadAll({ force: true });
 
-  // 10秒自动刷新
+  // 3秒自动刷新，和服务端快照刷新节奏对齐。
   window.setInterval(() => {
     loadAll({ force: false });
-  }, 10 * 1000);
+  }, 3 * 1000);
 
   initHistory();
 }

@@ -197,6 +197,11 @@ COLLECTOR_INTERVAL_S = max(5.0, float(os.environ.get("COLLECTOR_INTERVAL_S", "10
 COLLECTOR_BATCH_SIZE = max(1, int(os.environ.get("COLLECTOR_BATCH_SIZE", "12")))
 COLLECTOR_SYMBOL_REFRESH_S = max(30.0, float(os.environ.get("COLLECTOR_SYMBOL_REFRESH_S", "300")))
 COLLECTOR_WORKERS = max(1, int(os.environ.get("COLLECTOR_WORKERS", "8")))
+SNAPSHOT_REFRESH_INTERVAL_S = max(2.0, float(os.environ.get("SNAPSHOT_REFRESH_INTERVAL_S", "3")))
+SNAPSHOT_ACTIVE_TTL_S = max(60.0, float(os.environ.get("SNAPSHOT_ACTIVE_TTL_S", "900")))
+SNAPSHOT_DEFAULT_MAX_AGE_S = max(
+    SNAPSHOT_REFRESH_INTERVAL_S * 2.5, float(os.environ.get("SNAPSHOT_DEFAULT_MAX_AGE_S", "8"))
+)
 
 HISTORY_RANGE_MIN_S = 60
 HISTORY_RANGE_MAX_S = 7 * 24 * 3600
@@ -210,9 +215,185 @@ HIST_SYMBOLS_LIMIT_MAX = 500
 HIST_SYMBOLS_MIN_POINTS_MIN = 1
 HIST_SYMBOLS_MIN_POINTS_MAX = 1000
 
+SNAPSHOTS: dict[str, dict[str, dict]] = {"funding": {}, "price": {}}
+SNAPSHOT_LOCK = threading.Lock()
+
 
 def _http_get_json(url: str, timeout_s: float) -> dict:
     return get_json(url, timeout_s=timeout_s, user_agent="arb-dashboard/1.0")
+
+
+def default_funding_snapshot_params() -> dict[str, object]:
+    return {
+        "notional": 1000.0,
+        "top": 30,
+        "lighter_spread_bps": 5.0,
+        "var_fee_bps": 0.0,
+        "fetch_last": True,
+        "fetch_limit": 8,
+        "funding_sign": "longs_pay",
+        "timeout_s": 25.0,
+    }
+
+
+def default_price_snapshot_params() -> dict[str, object]:
+    return {
+        "notional": 1000.0,
+        "top": 30,
+        "lighter_spread_bps": 5.0,
+        "var_fee_bps": 0.0,
+        "max_markets": 40,
+        "concurrency": 16,
+        "cache_seconds": 30.0,
+        "timeout_s": 25.0,
+    }
+
+
+def funding_snapshot_key(params: dict[str, object]) -> str:
+    return (
+        "funding"
+        f"|n={params['notional']}"
+        f"|top={params['top']}"
+        f"|ls={params['lighter_spread_bps']}"
+        f"|vf={params['var_fee_bps']}"
+        f"|fl={int(bool(params['fetch_last']))}"
+        f"|fll={params['fetch_limit']}"
+        f"|fs={params['funding_sign']}"
+    )
+
+
+def price_snapshot_key(params: dict[str, object]) -> str:
+    return (
+        "price"
+        f"|n={params['notional']}"
+        f"|top={params['top']}"
+        f"|ls={params['lighter_spread_bps']}"
+        f"|vf={params['var_fee_bps']}"
+        f"|mm={params['max_markets']}"
+        f"|ccy={params['concurrency']}"
+        f"|ocs={params['cache_seconds']}"
+    )
+
+
+def seed_snapshot_targets() -> None:
+    funding_params = default_funding_snapshot_params()
+    price_params = default_price_snapshot_params()
+    now = time.time()
+    with SNAPSHOT_LOCK:
+        SNAPSHOTS.setdefault("funding", {}).setdefault(
+            funding_snapshot_key(funding_params),
+            {
+                "params": funding_params,
+                "data": None,
+                "updated_at": 0.0,
+                "last_access": now,
+                "last_error": None,
+            },
+        )
+        SNAPSHOTS.setdefault("price", {}).setdefault(
+            price_snapshot_key(price_params),
+            {
+                "params": price_params,
+                "data": None,
+                "updated_at": 0.0,
+                "last_access": now,
+                "last_error": None,
+            },
+        )
+
+
+def _snapshot_payload(data: dict, source: str, updated_at: float, last_error: str | None) -> dict:
+    payload = dict(data)
+    age_ms = max(0, int((time.time() - updated_at) * 1000)) if updated_at > 0 else None
+    payload["source"] = source
+    payload["snapshot_asof_unix"] = int(updated_at) if updated_at > 0 else None
+    payload["snapshot_age_ms"] = age_ms
+    if last_error:
+        payload["snapshot_last_error"] = last_error
+    return payload
+
+
+def resolve_snapshot_payload(
+    kind: str,
+    key: str,
+    params: dict[str, object],
+    *,
+    force: bool,
+    snapshot_max_age_s: float,
+    live_fetcher,
+) -> dict:
+    now = time.time()
+    stale_data: dict | None = None
+    stale_updated_at = 0.0
+    stale_error: str | None = None
+    with SNAPSHOT_LOCK:
+        bucket = SNAPSHOTS.setdefault(kind, {})
+        entry = bucket.setdefault(
+            key,
+            {
+                "params": dict(params),
+                "data": None,
+                "updated_at": 0.0,
+                "last_access": now,
+                "last_error": None,
+            },
+        )
+        entry["params"] = dict(params)
+        entry["last_access"] = now
+        stale_data = entry.get("data")
+        stale_updated_at = float(entry.get("updated_at") or 0.0)
+        stale_error = entry.get("last_error")
+        if (
+            not force
+            and stale_data is not None
+            and stale_updated_at > 0
+            and (now - stale_updated_at) <= max(0.0, float(snapshot_max_age_s))
+        ):
+            return _snapshot_payload(stale_data, "snapshot", stale_updated_at, stale_error)
+
+    try:
+        data = live_fetcher()
+    except Exception as exc:
+        with SNAPSHOT_LOCK:
+            entry = SNAPSHOTS.setdefault(kind, {}).setdefault(
+                key,
+                {
+                    "params": dict(params),
+                    "data": stale_data,
+                    "updated_at": stale_updated_at,
+                    "last_access": now,
+                    "last_error": None,
+                },
+            )
+            entry["last_access"] = now
+            entry["last_error"] = str(exc)
+            stale_data = entry.get("data")
+            stale_updated_at = float(entry.get("updated_at") or 0.0)
+            stale_error = entry.get("last_error")
+        if stale_data is not None and not force:
+            payload = _snapshot_payload(stale_data, "snapshot", stale_updated_at, stale_error)
+            payload["snapshot_stale"] = True
+            return payload
+        raise
+
+    updated_at = time.time()
+    with SNAPSHOT_LOCK:
+        entry = SNAPSHOTS.setdefault(kind, {}).setdefault(
+            key,
+            {
+                "params": dict(params),
+                "data": None,
+                "updated_at": 0.0,
+                "last_access": updated_at,
+                "last_error": None,
+            },
+        )
+        entry["params"] = dict(params)
+        entry["data"] = data
+        entry["updated_at"] = updated_at
+        entry["last_access"] = updated_at
+        entry["last_error"] = None
+    return _snapshot_payload(data, "live", updated_at, None)
 
 
 def normalize_history_query(range_s: int, limit: int) -> tuple[int, int]:
@@ -435,6 +616,165 @@ def _get_lighter_last(symbol: str, timeout_s: float = 10.0) -> float | None:
     return last
 
 
+def build_funding_payload(params: dict[str, object]) -> dict:
+    argv = [
+        "--json",
+        "--notional",
+        str(params["notional"]),
+        "--top",
+        str(params["top"]),
+        "--lighter-spread-bps",
+        str(params["lighter_spread_bps"]),
+        "--var-fee-bps",
+        str(params["var_fee_bps"]),
+        "--funding-sign",
+        str(params["funding_sign"]),
+    ]
+    if params["fetch_last"]:
+        argv += ["--fetch-lighter-last", "--fetch-lighter-last-limit", str(params["fetch_limit"])]
+
+    data = _run_module_json(arb_rank.main, argv, timeout_s=float(params["timeout_s"]))
+    ts = int(time.time())
+    rows = []
+    for it in data.get("items", []) or []:
+        sym = it.get("symbol")
+        b = it.get("basis_bps_indicative")
+        prices = it.get("prices") or {}
+        var_mid = prices.get("var_mid")
+        ll = prices.get("lighter_last_trade")
+        var_obj = it.get("var") or {}
+        var_bid = var_obj.get("bid")
+        var_ask = var_obj.get("ask")
+        lighter_bid = prices.get("lighter_best_bid")
+        lighter_ask = prices.get("lighter_best_ask")
+        if sym:
+            rows.append(
+                (
+                    ts,
+                    sym,
+                    "funding_basis",
+                    var_mid,
+                    ll,
+                    b,
+                    var_bid,
+                    var_ask,
+                    lighter_bid,
+                    lighter_ask,
+                )
+            )
+    _db_insert_many(rows)
+    return data
+
+
+def build_price_payload(params: dict[str, object]) -> dict:
+    argv = [
+        "--json",
+        "--名义本金",
+        str(params["notional"]),
+        "--显示前N",
+        str(params["top"]),
+        "--Lighter点差bps",
+        str(params["lighter_spread_bps"]),
+        "--VAR手续费bps",
+        str(params["var_fee_bps"]),
+        "--最多市场数",
+        str(params["max_markets"]),
+        "--并发",
+        str(params["concurrency"]),
+        "--缓存秒",
+        str(params["cache_seconds"]),
+    ]
+    data = _run_module_json(price_arb_cn.main, argv, timeout_s=float(params["timeout_s"]))
+    ts = int(time.time())
+    rows = []
+    for it in data.get("items", []) or []:
+        sym = it.get("symbol")
+        b = it.get("diff_bps")
+        var_obj = it.get("var") or {}
+        lighter_obj = it.get("lighter") or {}
+        var_mid = var_obj.get("mid")
+        ll = lighter_obj.get("last_trade")
+        var_bid = var_obj.get("bid")
+        var_ask = var_obj.get("ask")
+        lighter_bid = lighter_obj.get("best_bid")
+        lighter_ask = lighter_obj.get("best_ask")
+        if sym:
+            rows.append(
+                (
+                    ts,
+                    sym,
+                    "price_diff",
+                    var_mid,
+                    ll,
+                    b,
+                    var_bid,
+                    var_ask,
+                    lighter_bid,
+                    lighter_ask,
+                )
+            )
+    _db_insert_many(rows)
+    return data
+
+
+def _snapshot_work_items(kind: str) -> list[tuple[str, dict[str, object]]]:
+    now = time.time()
+    with SNAPSHOT_LOCK:
+        bucket = SNAPSHOTS.get(kind, {})
+        return [
+            (key, dict(entry.get("params") or {}))
+            for key, entry in bucket.items()
+            if (now - float(entry.get("last_access") or 0.0)) <= SNAPSHOT_ACTIVE_TTL_S
+        ]
+
+
+def _refresh_snapshot(kind: str, key: str, params: dict[str, object]) -> None:
+    fetcher = build_funding_payload if kind == "funding" else build_price_payload
+    try:
+        data = fetcher(params)
+    except Exception as exc:
+        with SNAPSHOT_LOCK:
+            entry = SNAPSHOTS.setdefault(kind, {}).setdefault(
+                key,
+                {
+                    "params": dict(params),
+                    "data": None,
+                    "updated_at": 0.0,
+                    "last_access": time.time(),
+                    "last_error": None,
+                },
+            )
+            entry["last_error"] = str(exc)
+        return
+    updated_at = time.time()
+    with SNAPSHOT_LOCK:
+        entry = SNAPSHOTS.setdefault(kind, {}).setdefault(
+            key,
+            {
+                "params": dict(params),
+                "data": None,
+                "updated_at": 0.0,
+                "last_access": updated_at,
+                "last_error": None,
+            },
+        )
+        entry["params"] = dict(params)
+        entry["data"] = data
+        entry["updated_at"] = updated_at
+        entry["last_error"] = None
+
+
+def _snapshot_loop(kind: str) -> None:
+    while True:
+        seed_snapshot_targets()
+        for key, params in _snapshot_work_items(kind):
+            try:
+                _refresh_snapshot(kind, key, params)
+            except Exception:
+                continue
+        time.sleep(SNAPSHOT_REFRESH_INTERVAL_S)
+
+
 def _sampler_loop() -> None:
     # Background sampler: periodically records basis history for watched symbols.
     while True:
@@ -582,148 +922,55 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_api(self, u) -> None:
         q = parse_qs(u.query)
-        ttl_s = _qget_float(q, "cache_s", 300.0)
         force = _qget_bool(q, "force", False)
         timeout_s = _qget_float(q, "timeout_s", 45.0)
+        snapshot_max_age_s = _qget_float(q, "snapshot_max_age_s", SNAPSHOT_DEFAULT_MAX_AGE_S)
 
         try:
             if u.path == "/api/funding":
-                notional = _qget_float(q, "notional", 1000.0)
                 top = _qget_int(q, "top", 30)
-                lighter_spread_bps = _qget_float(q, "lighter_spread_bps", 5.0)
-                var_fee_bps = _qget_float(q, "var_fee_bps", 0.0)
-                fetch_last = _qget_bool(q, "fetch_lighter_last", True)
-                fetch_limit = _qget_int(q, "fetch_lighter_last_limit", top)
-                funding_sign = _qget(q, "funding_sign", "longs_pay")
-                key = (
-                    f"funding|n={notional}|top={top}|ls={lighter_spread_bps}|vf={var_fee_bps}"
-                    f"|fl={int(fetch_last)}|fll={fetch_limit}|fs={funding_sign}"
+                params = {
+                    "notional": _qget_float(q, "notional", 1000.0),
+                    "top": top,
+                    "lighter_spread_bps": _qget_float(q, "lighter_spread_bps", 5.0),
+                    "var_fee_bps": _qget_float(q, "var_fee_bps", 0.0),
+                    "fetch_last": _qget_bool(q, "fetch_lighter_last", True),
+                    "fetch_limit": _qget_int(q, "fetch_lighter_last_limit", top),
+                    "funding_sign": _qget(q, "funding_sign", "longs_pay"),
+                    "timeout_s": timeout_s,
+                }
+                key = funding_snapshot_key(params)
+                data = resolve_snapshot_payload(
+                    "funding",
+                    key,
+                    params,
+                    force=force,
+                    snapshot_max_age_s=snapshot_max_age_s,
+                    live_fetcher=lambda: build_funding_payload(params),
                 )
-                if not force:
-                    cached = CACHE.get(key, ttl_s=ttl_s)
-                    if cached is not None:
-                        self._send_json(200, cached)
-                        return
-
-                argv = [
-                    "--json",
-                    "--notional",
-                    str(notional),
-                    "--top",
-                    str(top),
-                    "--lighter-spread-bps",
-                    str(lighter_spread_bps),
-                    "--var-fee-bps",
-                    str(var_fee_bps),
-                    "--funding-sign",
-                    funding_sign,
-                ]
-                if fetch_last:
-                    argv += ["--fetch-lighter-last", "--fetch-lighter-last-limit", str(fetch_limit)]
-
-                data = _run_module_json(arb_rank.main, argv, timeout_s=timeout_s)
-                # Persist basis history for these items (if available).
-                ts = int(time.time())
-                rows = []
-                for it in data.get("items", []) or []:
-                    sym = it.get("symbol")
-                    b = it.get("basis_bps_indicative")
-                    prices = it.get("prices") or {}
-                    var_mid = prices.get("var_mid")
-                    ll = prices.get("lighter_last_trade")
-                    var_obj = it.get("var") or {}
-                    var_bid = var_obj.get("bid")
-                    var_ask = var_obj.get("ask")
-                    lighter_bid = prices.get("lighter_best_bid")
-                    lighter_ask = prices.get("lighter_best_ask")
-                    if sym:
-                        rows.append(
-                            (
-                                ts,
-                                sym,
-                                "funding_basis",
-                                var_mid,
-                                ll,
-                                b,
-                                var_bid,
-                                var_ask,
-                                lighter_bid,
-                                lighter_ask,
-                            )
-                        )
-                _db_insert_many(rows)
-                CACHE.set(key, data)
                 self._send_json(200, data)
                 return
 
             if u.path == "/api/price":
-                notional = _qget_float(q, "notional", 1000.0)
-                top = _qget_int(q, "top", 30)
-                lighter_spread_bps = _qget_float(q, "lighter_spread_bps", 5.0)
-                var_fee_bps = _qget_float(q, "var_fee_bps", 0.0)
-                max_markets = _qget_int(q, "max_markets", 120)
-                concurrency = _qget_int(q, "concurrency", 16)
-                cache_seconds = _qget_float(q, "orderbook_cache_s", 30.0)
-
-                key = (
-                    f"price|n={notional}|top={top}|ls={lighter_spread_bps}|vf={var_fee_bps}"
-                    f"|mm={max_markets}|ccy={concurrency}|ocs={cache_seconds}"
+                params = {
+                    "notional": _qget_float(q, "notional", 1000.0),
+                    "top": _qget_int(q, "top", 30),
+                    "lighter_spread_bps": _qget_float(q, "lighter_spread_bps", 5.0),
+                    "var_fee_bps": _qget_float(q, "var_fee_bps", 0.0),
+                    "max_markets": _qget_int(q, "max_markets", 120),
+                    "concurrency": _qget_int(q, "concurrency", 16),
+                    "cache_seconds": _qget_float(q, "orderbook_cache_s", 30.0),
+                    "timeout_s": timeout_s,
+                }
+                key = price_snapshot_key(params)
+                data = resolve_snapshot_payload(
+                    "price",
+                    key,
+                    params,
+                    force=force,
+                    snapshot_max_age_s=snapshot_max_age_s,
+                    live_fetcher=lambda: build_price_payload(params),
                 )
-                if not force:
-                    cached = CACHE.get(key, ttl_s=ttl_s)
-                    if cached is not None:
-                        self._send_json(200, cached)
-                        return
-
-                argv = [
-                    "--json",
-                    "--名义本金",
-                    str(notional),
-                    "--显示前N",
-                    str(top),
-                    "--Lighter点差bps",
-                    str(lighter_spread_bps),
-                    "--VAR手续费bps",
-                    str(var_fee_bps),
-                    "--最多市场数",
-                    str(max_markets),
-                    "--并发",
-                    str(concurrency),
-                    "--缓存秒",
-                    str(cache_seconds),
-                ]
-                data = _run_module_json(price_arb_cn.main, argv, timeout_s=timeout_s)
-                # Persist diff history for these items.
-                ts = int(time.time())
-                rows = []
-                for it in data.get("items", []) or []:
-                    sym = it.get("symbol")
-                    b = it.get("diff_bps")
-                    var_obj = it.get("var") or {}
-                    lighter_obj = it.get("lighter") or {}
-                    var_mid = var_obj.get("mid")
-                    ll = lighter_obj.get("last_trade")
-                    var_bid = var_obj.get("bid")
-                    var_ask = var_obj.get("ask")
-                    lighter_bid = lighter_obj.get("best_bid")
-                    lighter_ask = lighter_obj.get("best_ask")
-                    if sym:
-                        rows.append(
-                            (
-                                ts,
-                                sym,
-                                "price_diff",
-                                var_mid,
-                                ll,
-                                b,
-                                var_bid,
-                                var_ask,
-                                lighter_bid,
-                                lighter_ask,
-                            )
-                        )
-                _db_insert_many(rows)
-                CACHE.set(key, data)
                 self._send_json(200, data)
                 return
 
@@ -951,6 +1198,11 @@ def main() -> int:
     port = int(os.environ.get("PORT", "8099"))
     if not os.path.isdir(WEB_DIR):
         raise SystemExit(f"Missing web dir: {WEB_DIR}")
+    seed_snapshot_targets()
+    funding_snapshot = threading.Thread(target=_snapshot_loop, args=("funding",), name="funding-snapshot", daemon=True)
+    funding_snapshot.start()
+    price_snapshot = threading.Thread(target=_snapshot_loop, args=("price",), name="price-snapshot", daemon=True)
+    price_snapshot.start()
     th = threading.Thread(target=_sampler_loop, name="basis-sampler", daemon=True)
     th.start()
     collector = threading.Thread(target=_collector_loop, name="history-collector", daemon=True)
@@ -958,6 +1210,9 @@ def main() -> int:
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"Dashboard: http://{host}:{port}")
     print("API: /api/funding , /api/price")
+    print(
+        f"Snapshots: interval={SNAPSHOT_REFRESH_INTERVAL_S:.1f}s max_age_default={SNAPSHOT_DEFAULT_MAX_AGE_S:.1f}s"
+    )
     print(
         f"Collector: enabled interval={COLLECTOR_INTERVAL_S:.1f}s batch={COLLECTOR_BATCH_SIZE} workers={COLLECTOR_WORKERS}"
     )
