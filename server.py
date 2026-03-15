@@ -219,6 +219,9 @@ FULL_SNAPSHOT_DEFAULT_MAX_AGE_S = max(
 )
 LIGHTER_WS_MARKET_REFRESH_S = max(30.0, float(os.environ.get("LIGHTER_WS_MARKET_REFRESH_S", "60")))
 LIGHTER_WS_STALE_AFTER_S = max(1.0, float(os.environ.get("LIGHTER_WS_STALE_AFTER_S", "10")))
+VAR_STATS_FEED_REFRESH_S = max(0.5, float(os.environ.get("VAR_STATS_FEED_REFRESH_S", "1")))
+LIGHTER_FUNDING_FEED_REFRESH_S = max(0.5, float(os.environ.get("LIGHTER_FUNDING_FEED_REFRESH_S", "1")))
+LIGHTER_ORDERBOOKS_FEED_REFRESH_S = max(10.0, float(os.environ.get("LIGHTER_ORDERBOOKS_FEED_REFRESH_S", "60")))
 
 HISTORY_RANGE_MIN_S = 60
 HISTORY_RANGE_MAX_S = 7 * 24 * 3600
@@ -234,6 +237,8 @@ HIST_SYMBOLS_MIN_POINTS_MAX = 1000
 
 SNAPSHOTS: dict[str, dict[str, dict]] = {"funding": {}, "price": {}}
 SNAPSHOT_LOCK = threading.Lock()
+FEED_CACHE: dict[str, dict[str, object]] = {}
+FEED_CACHE_LOCK = threading.Lock()
 
 
 class LighterOrderBookState:
@@ -449,6 +454,60 @@ LIGHTER_ORDERBOOK_STREAM = LighterOrderBookStream()
 
 def _http_get_json(url: str, timeout_s: float) -> dict:
     return get_json(url, timeout_s=timeout_s, user_agent="arb-dashboard/1.0")
+
+
+def _feed_cache_set(name: str, data: dict, *, updated_at: float | None = None, last_error: str | None = None) -> None:
+    ts = time.time() if updated_at is None else float(updated_at)
+    with FEED_CACHE_LOCK:
+        FEED_CACHE[name] = {
+            "data": data,
+            "updated_at": ts,
+            "last_error": last_error,
+        }
+
+
+def _feed_cache_get(name: str, *, max_age_s: float | None = None) -> tuple[dict | None, int | None]:
+    with FEED_CACHE_LOCK:
+        entry = FEED_CACHE.get(name) or {}
+        data = entry.get("data")
+        updated_at = float(entry.get("updated_at") or 0.0)
+    if not isinstance(data, dict) or updated_at <= 0:
+        return (None, None)
+    age_ms = int(max(0.0, time.time() - updated_at) * 1000)
+    if max_age_s is not None and (age_ms / 1000.0) > max_age_s:
+        return (None, age_ms)
+    return (data, age_ms)
+
+
+def _feed_cache_get_or_fetch(
+    name: str,
+    *,
+    max_age_s: float,
+    fetcher,
+) -> tuple[dict, int | None]:
+    cached, age_ms = _feed_cache_get(name, max_age_s=max_age_s)
+    if cached is not None:
+        return (cached, age_ms)
+    data = fetcher()
+    _feed_cache_set(name, data)
+    return (data, 0)
+
+
+def refresh_fast_feed_cache_once(timeout_s: float = 10.0) -> None:
+    _feed_cache_set("var_stats", _http_get_json(VARIATIONAL_STATS_URL, timeout_s=timeout_s))
+    _feed_cache_set("lighter_funding", _http_get_json(arb_rank.LIGHTER_FUNDING_URL, timeout_s=timeout_s))
+    _feed_cache_set("lighter_orderbooks", _http_get_json(LIGHTER_ORDERBOOKS_URL, timeout_s=timeout_s))
+
+
+def _feed_refresh_loop(name: str, url: str, refresh_interval_s: float, timeout_s: float) -> None:
+    while True:
+        try:
+            _feed_cache_set(name, _http_get_json(url, timeout_s=timeout_s))
+        except Exception as exc:
+            with FEED_CACHE_LOCK:
+                entry = FEED_CACHE.setdefault(name, {})
+                entry["last_error"] = str(exc)
+        time.sleep(max(0.1, refresh_interval_s))
 
 
 def default_snapshot_max_age(detail_level: str) -> float:
@@ -892,9 +951,22 @@ def _get_lighter_last(symbol: str, timeout_s: float = 10.0) -> float | None:
 def build_funding_payload_fast(params: dict[str, object]) -> dict:
     t0 = time.time()
     pos_means_longs_pay = str(params["funding_sign"]) == "longs_pay"
-    var_j = arb_rank.http_get_json(arb_rank.VARIATIONAL_STATS_URL, timeout_s=float(params["timeout_s"]))
-    lighter_funding_j = arb_rank.http_get_json(arb_rank.LIGHTER_FUNDING_URL, timeout_s=float(params["timeout_s"]))
-    lighter_meta_j = arb_rank.http_get_json(arb_rank.LIGHTER_ORDERBOOKS_URL, timeout_s=float(params["timeout_s"]))
+    timeout_s = float(params["timeout_s"])
+    var_j, var_age_ms = _feed_cache_get_or_fetch(
+        "var_stats",
+        max_age_s=3.0,
+        fetcher=lambda: arb_rank.http_get_json(arb_rank.VARIATIONAL_STATS_URL, timeout_s=timeout_s),
+    )
+    lighter_funding_j, lighter_funding_age_ms = _feed_cache_get_or_fetch(
+        "lighter_funding",
+        max_age_s=3.0,
+        fetcher=lambda: arb_rank.http_get_json(arb_rank.LIGHTER_FUNDING_URL, timeout_s=timeout_s),
+    )
+    lighter_meta_j, lighter_meta_age_ms = _feed_cache_get_or_fetch(
+        "lighter_orderbooks",
+        max_age_s=60.0,
+        fetcher=lambda: arb_rank.http_get_json(arb_rank.LIGHTER_ORDERBOOKS_URL, timeout_s=timeout_s),
+    )
 
     aliases = arb_rank.parse_symbol_aliases(str(params.get("symbol_aliases_json") or ""))
     var = arb_rank.parse_variational_markets(
@@ -946,6 +1018,11 @@ def build_funding_payload_fast(params: dict[str, object]) -> dict:
         },
         "items": [],
         "fetch_ms": int((time.time() - t0) * 1000),
+        "market_feed_age_ms": {
+            "var_stats": var_age_ms,
+            "lighter_funding": lighter_funding_age_ms,
+            "lighter_orderbooks": lighter_meta_age_ms,
+        },
     }
     ranked_show = ranked[: max(int(params["top"]), 0)] if int(params["top"]) else ranked
     for net_1d, r, strat, funding_1d, cost, breakeven_days in ranked_show:
@@ -1037,8 +1114,16 @@ def build_price_payload_fast(params: dict[str, object]) -> dict:
     t0 = time.time()
     aliases = price_arb_cn.parse_symbol_aliases(str(params.get("symbol_aliases_json") or ""))
     timeout_s = float(params["timeout_s"])
-    var_j = price_arb_cn.http_get_json(price_arb_cn.VARIATIONAL_STATS_URL, timeout_s=timeout_s)
-    lighter_meta_j = price_arb_cn.http_get_json(price_arb_cn.LIGHTER_ORDERBOOKS_URL, timeout_s=timeout_s)
+    var_j, var_age_ms = _feed_cache_get_or_fetch(
+        "var_stats",
+        max_age_s=3.0,
+        fetcher=lambda: price_arb_cn.http_get_json(price_arb_cn.VARIATIONAL_STATS_URL, timeout_s=timeout_s),
+    )
+    lighter_meta_j, lighter_meta_age_ms = _feed_cache_get_or_fetch(
+        "lighter_orderbooks",
+        max_age_s=60.0,
+        fetcher=lambda: price_arb_cn.http_get_json(price_arb_cn.LIGHTER_ORDERBOOKS_URL, timeout_s=timeout_s),
+    )
 
     var_map: dict[str, tuple[float | None, float | None, float | None, float | None]] = {}
     for it in (var_j.get("listings") or []):
@@ -1157,6 +1242,10 @@ def build_price_payload_fast(params: dict[str, object]) -> dict:
         "lighter_ws_covered": int(len(ws_quotes)),
         "lighter_ws_age_ms": ws_meta.get("age_ms"),
         "lighter_ws_fallback_count": len(missing_markets),
+        "market_feed_age_ms": {
+            "var_stats": var_age_ms,
+            "lighter_orderbooks": lighter_meta_age_ms,
+        },
         "items": [],
     }
     show = rows[: max(0, int(params["top"]))]
@@ -1771,6 +1860,17 @@ def main() -> int:
         raise SystemExit(f"Missing web dir: {WEB_DIR}")
     seed_snapshot_targets()
     LIGHTER_ORDERBOOK_STREAM.ensure_started()
+    for name, url, refresh_s in (
+        ("var_stats", VARIATIONAL_STATS_URL, VAR_STATS_FEED_REFRESH_S),
+        ("lighter_funding", arb_rank.LIGHTER_FUNDING_URL, LIGHTER_FUNDING_FEED_REFRESH_S),
+        ("lighter_orderbooks", LIGHTER_ORDERBOOKS_URL, LIGHTER_ORDERBOOKS_FEED_REFRESH_S),
+    ):
+        threading.Thread(
+            target=_feed_refresh_loop,
+            args=(name, url, refresh_s, 10.0),
+            name=f"{name}-feed-refresh",
+            daemon=True,
+        ).start()
     _warm_default_fast_snapshots()
     for kind, detail_level in (
         ("funding", "fast"),

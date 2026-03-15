@@ -50,6 +50,7 @@ class HistoryHelperTests(unittest.TestCase):
 class SnapshotHelperTests(unittest.TestCase):
     def setUp(self):
         server.SNAPSHOTS = {"funding": {}, "price": {}}
+        server.FEED_CACHE = {}
 
     def test_seed_snapshot_targets_registers_fast_and_full_dashboard_queries(self):
         server.seed_snapshot_targets()
@@ -290,6 +291,129 @@ class SnapshotHelperTests(unittest.TestCase):
         self.assertEqual(snap["best_bid"], 99.5)
         self.assertAlmostEqual(snap["mid"], 100.0)
         self.assertEqual(snap["age_ms"], 200)
+
+    def test_build_funding_payload_fast_uses_feed_cache(self):
+        params = {
+            "funding_sign": "longs_pay",
+            "timeout_s": 10.0,
+            "var_fee_bps": 0.0,
+            "lighter_spread_bps": 5.0,
+            "notional": 1000.0,
+            "top": 5,
+        }
+        server.FEED_CACHE = {
+            "var_stats": {"data": {"listings": []}, "updated_at": time.time()},
+            "lighter_funding": {"data": {"code": 200, "funding_rates": []}, "updated_at": time.time()},
+            "lighter_orderbooks": {"data": {"code": 200, "order_books": []}, "updated_at": time.time()},
+        }
+
+        with mock.patch.object(
+            server.arb_rank,
+            "http_get_json",
+            side_effect=[
+                {"listings": []},
+                {"code": 200, "funding_rates": []},
+                {"code": 200, "order_books": []},
+            ],
+        ) as http_get:
+            payload = server.build_funding_payload_fast(params)
+
+        self.assertEqual(http_get.call_count, 0)
+        self.assertEqual(payload["items"], [])
+        self.assertIn("market_feed_age_ms", payload)
+
+    def test_build_price_payload_fast_uses_feed_cache(self):
+        params = {
+            "notional": 1000.0,
+            "top": 5,
+            "lighter_spread_bps": 5.0,
+            "var_fee_bps": 0.0,
+            "max_markets": 5,
+            "concurrency": 4,
+            "timeout_s": 10.0,
+        }
+        server.FEED_CACHE = {
+            "var_stats": {
+                "data": {
+                    "listings": [
+                        {
+                            "ticker": "BTC",
+                            "quotes": {"size_1k": {"bid": "100.0", "ask": "100.2"}},
+                            "mark_price": "100.1",
+                        }
+                    ]
+                },
+                "updated_at": time.time(),
+            },
+            "lighter_orderbooks": {
+                "data": {
+                    "code": 200,
+                    "order_books": [
+                        {
+                            "symbol": "BTC",
+                            "market_id": 1,
+                            "status": "active",
+                            "market_type": "perp",
+                            "min_base_amount": "0.001",
+                            "min_quote_amount": "1",
+                            "taker_fee": "0.0005",
+                        }
+                    ],
+                },
+                "updated_at": time.time(),
+            },
+        }
+
+        with (
+            mock.patch.object(
+                server.price_arb_cn,
+                "http_get_json",
+                side_effect=[
+                    {"listings": []},
+                    {"code": 200, "order_books": []},
+                ],
+            ) as http_get,
+            mock.patch.object(
+                server,
+                "_get_lighter_ws_quotes_for_symbols",
+                return_value=(
+                    {
+                        "BTC": {
+                            "best_bid": 99.9,
+                            "best_ask": 100.1,
+                            "mid": 100.0,
+                            "source": "ws_orderbook",
+                            "age_ms": 100,
+                        }
+                    },
+                    {"connected": True, "subscribed": 1, "covered": 1, "age_ms": 100},
+                ),
+            ),
+        ):
+            payload = server.build_price_payload_fast(params)
+
+        self.assertEqual(http_get.call_count, 0)
+        self.assertEqual(payload["lighter_ws_fallback_count"], 0)
+        self.assertEqual(payload["items"][0]["symbol"], "BTC")
+        self.assertIn("market_feed_age_ms", payload)
+
+    def test_refresh_fast_feed_cache_once_updates_all_entries(self):
+        def fake_http(url, timeout_s):
+            if "variational" in url:
+                return {"listings": [{"ticker": "BTC"}]}
+            if "funding-rates" in url:
+                return {"code": 200, "funding_rates": [{"symbol": "BTC"}]}
+            if "orderBooks" in url:
+                return {"code": 200, "order_books": [{"symbol": "BTC", "market_id": 1}]}
+            raise AssertionError(url)
+
+        with mock.patch.object(server, "_http_get_json", side_effect=fake_http):
+            server.refresh_fast_feed_cache_once(timeout_s=5.0)
+
+        self.assertIn("var_stats", server.FEED_CACHE)
+        self.assertIn("lighter_funding", server.FEED_CACHE)
+        self.assertIn("lighter_orderbooks", server.FEED_CACHE)
+        self.assertEqual(server.FEED_CACHE["var_stats"]["data"]["listings"][0]["ticker"], "BTC")
 
 
 if __name__ == "__main__":
